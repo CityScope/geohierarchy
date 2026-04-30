@@ -1,0 +1,36 @@
+[project]
+name = "geohierarchy"
+version = "0.1.0"
+description = "A high-performance hierarchical geospatial data management library using Polars and GeoPandas, inspired by h3-toolkit."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    { name = "Miguel Ureña Pliego" }
+]
+dependencies = [
+    "polars>=1.0.0",
+    "geopandas>=0.14.0",
+    "h3ronpy>=0.18.0",
+    "pyarrow>=15.0.0",
+    "rasterio>=1.3.0",
+    "fiona>=1.9.0",
+    "shapely>=2.0.0",
+    "httpx>=0.27.0", # For GBaseClient async operations
+    "pandas>=2.3.3",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.0.0",
+    "ipykernel>=6.0.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,42 @@
+# Sphinx build output
+docs/_build/
+_build/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+.venv/
+venv/
+
+# Documentation build files
+docs/build/
+
+# Python egg files
+*.egg-info
+dist/
+build/
+
+# # Ignore everything in examples/
+# examples/**
+
+# # BUT include files directly inside examples/ (no subfolders)
+# !examples/*
+# examples/*/
+
+# # Exclude files that start with "local" (both .py and .ipynb or any extension)
+# examples/local*
+
+**/api_keys.py
+
+# anything with "cache" in folder or file name
+**/*cache*/
+**/*cache*
+
+**/secrets.txt
+
+**/accessibility_streets.gpkg
+**/block.gpkg
+**/blockgroup.gpkg
