@@ -93,6 +93,28 @@ def area(
     line_area=0,
     point_area=0,
 ):
+    """Compute per-geometry area in square meters, CRS-aware.
+
+    Uses the CRS's own units directly if already projected; otherwise
+    reprojects to a local UTM zone when the data fits within one, and
+    falls back to geodesic area computation on the ellipsoid otherwise.
+
+    Args:
+        gdf: Geometries to measure.
+        max_width_m: Maximum east-west extent (meters) considered safe for
+            a single UTM projection.
+        max_height_m: Maximum north-south extent (meters) considered safe
+            for a single UTM projection.
+        ellps: Ellipsoid name passed to :class:`pyproj.Geod` for the
+            geodesic fallback. Derived from ``gdf``'s CRS if ``None``.
+        geod: :class:`pyproj.Geod` instance used for geodesic area
+            computation.
+        line_area: Area value assigned to line geometries, if not ``0``.
+        point_area: Area value assigned to point geometries, if not ``0``.
+
+    Returns:
+        A pandas Series of areas aligned with ``gdf``.
+    """
     if gdf.crs.is_projected:
         res = gdf.geometry.area
     else:
@@ -125,6 +147,27 @@ def length(
     geod=Geod(ellps="WGS84"),
     point_length=0,
 ):
+    """Compute per-geometry length in meters, CRS-aware.
+
+    Same reprojection/fallback strategy as :func:`area`, applied to
+    line/polygon-boundary length instead of area.
+
+    Args:
+        gdf: Geometries to measure.
+        max_width_m: Maximum east-west extent (meters) considered safe for
+            a single UTM projection.
+        max_height_m: Maximum north-south extent (meters) considered safe
+            for a single UTM projection.
+        ellps: Ellipsoid name passed to :class:`pyproj.Geod` for the
+            geodesic fallback. Derived from ``gdf``'s CRS if ``None``.
+        geod: :class:`pyproj.Geod` instance used for geodesic length
+            computation.
+        point_length: Length value assigned to point geometries, if not
+            ``0``.
+
+    Returns:
+        A pandas Series of lengths aligned with ``gdf``.
+    """
     if gdf.crs.is_projected:
         res = gdf.geometry.area
     else:
@@ -282,3 +325,43 @@ def get_id_mapping(
         mapping["_geoweight"] = 1.0
 
     return pl.from_pandas(mapping)
+
+
+def h3_cells(
+    geometry: "gpd.GeoDataFrame | gpd.GeoSeries", resolution: int
+) -> gpd.GeoDataFrame:
+    """Build an H3 cell grid covering a geometry, as polygon cells.
+
+    Useful for building an H3 hierarchy level with :meth:`GeoHierarchy.add_level`
+    -- H3 cells are plain polygons once vectorized, so they work as a core
+    layer exactly like any other polygon geometry (they can also be used
+    with :meth:`GeoHierarchy.add_vector_data` / :meth:`GeoHierarchy.add_raster_data`
+    as non-layer source data).
+
+    Args:
+        geometry: Geometries whose combined extent the H3 grid should
+            cover. Reprojected to EPSG:4326 first, since H3 operates on
+            geographic coordinates.
+        resolution: H3 resolution (0 = coarsest, ~15 = finest). See the
+            H3 documentation for the approximate cell size at each level.
+
+    Returns:
+        A GeoDataFrame in EPSG:4326 with an ``"h3"`` column (the cell
+        index as a hex string) and one polygon per covering cell.
+    """
+    import shapely.wkb
+    from h3ronpy import cells_to_string
+    from h3ronpy.vector import geometry_to_cells, cells_to_wkb_polygons
+
+    geometry = geometry.to_crs(4326)
+    union = (
+        geometry.union_all() if hasattr(geometry, "union_all") else geometry.unary_union
+    )
+
+    cells = geometry_to_cells(union, resolution=resolution)
+    wkb_arr = cells_to_wkb_polygons(cells)
+
+    ids = [c.as_py() for c in cells_to_string(cells)]
+    geoms = [shapely.wkb.loads(w.as_py()) for w in wkb_arr]
+
+    return gpd.GeoDataFrame({"h3": ids}, geometry=geoms, crs="EPSG:4326")
