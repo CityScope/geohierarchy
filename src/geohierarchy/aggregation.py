@@ -192,16 +192,42 @@ class AggregationStrategy(ABC):
             between the source and destination geometries, using the
             ``"_geoweight"`` column produced by
             :func:`geohierarchy.utils.get_id_mapping`.
+        mapping: Which id-mapping function pairs source and destination
+            rows: ``"overlap"`` (:func:`geohierarchy.utils.get_id_mapping`,
+            geometric intersection) or ``"knn"``
+            (:func:`geohierarchy.utils.get_knn_mapping`, inverse-distance
+            nearest neighbors -- see :class:`SmoothMean`).
+        preserve_total: Whether a column using this strategy has a
+            meaningful total that downscaling must reproduce exactly (an
+            absolute/additive quantity, e.g. population) as opposed to a
+            relative one with no sensible total (a rate, ratio, or median,
+            e.g. income). ``True`` for :class:`Sum`. Strategies whose
+            downscale isn't already exactly total-preserving by
+            construction (currently just :class:`SmoothMean`, whose
+            blending is spatial rather than proportional) use this flag to
+            trigger a corrective rescale in
+            :meth:`GeoHierarchy._aggregate_edge_batch` -- see
+            :meth:`SmoothMean.__init__`.
     """
 
-    def __init__(self, geoweighted: bool = False) -> None:
+    def __init__(
+        self,
+        geoweighted: bool = False,
+        mapping: str = "overlap",
+        preserve_total: bool = False,
+    ) -> None:
         """Initialize the strategy.
 
         Args:
             geoweighted: Whether to weight rows by geometric overlap
                 fraction during aggregation.
+            mapping: Id-mapping mode, ``"overlap"`` or ``"knn"``.
+            preserve_total: Whether this column's downscaled total should
+                exactly match its source total (see class docstring).
         """
         self.geoweighted = geoweighted
+        self.mapping = mapping
+        self.preserve_total = preserve_total
 
     @abstractmethod
     def upscale_aggs(self, columns: List[str]) -> List[pl.Expr]:
@@ -322,6 +348,15 @@ def aggregation_strategy(
 
         combined.downscale_exprs = _downscale_exprs
         combined.consolidate_downscale = _consolidate_downscale
+        # The downscale strategy's id-mapping mode (e.g. SmoothMean's "knn")
+        # governs the downscale pass, not upscale's own "overlap" default.
+        combined.mapping = downscale.mapping
+        combined.knn_k = getattr(downscale, "knn_k", None)
+        combined.knn_power = getattr(downscale, "knn_power", None)
+        # Likewise, whether the downscaled total should be corrected back
+        # to match the source total is a property of the downscale
+        # strategy actually used, not upscale's.
+        combined.preserve_total = downscale.preserve_total
 
     return combined
 
@@ -350,7 +385,7 @@ class Sum(AggregationStrategy):
             geoweighted: Whether to additionally weight rows by geometric
                 overlap fraction.
         """
-        super().__init__(geoweighted)
+        super().__init__(geoweighted, preserve_total=True)
         self.weight_column = weight_column
 
     def upscale_aggs(self, columns: List[str]) -> List[pl.Expr]:
@@ -421,6 +456,113 @@ class Mean(AggregationStrategy):
                     mean_expr(c, group_col, self.weight_column, self.geoweighted)
                 )
 
+        return exprs
+
+
+# ================================================================
+# SMOOTH MEAN (KNN-BLENDED DOWNSCALE)
+# ================================================================
+
+
+class SmoothMean(AggregationStrategy):
+    """A downscale that blends several nearby source cells instead of copying one.
+
+    :class:`Mean` and :class:`Sum`'s downscale strictly follows the source
+    geometry's boundaries: every destination row gets a value derived only
+    from whichever source row(s) it geometrically overlaps, so the result
+    is blocky wherever the source grid is much coarser than the
+    destination grid (e.g. downscaling from H3 resolution 8 to 9). This
+    strategy instead uses :func:`geohierarchy.utils.get_knn_mapping` to
+    blend each destination row's value from its ``k`` nearest source
+    centroids, inverse-distance weighted, which smooths out those
+    boundaries.
+
+    Only its downscale behavior is meaningful -- combine it with a normal
+    upscale strategy via :func:`aggregation_strategy`, e.g.::
+
+        set_aggregation("population", upscale=Sum(), downscale=SmoothMean(k=6, density=True))
+
+    :meth:`upscale_aggs` still works standalone (plain unweighted mean), so
+    the strategy is usable directly for a column that's only ever
+    downscaled.
+
+    ``density`` matters for any additive (count-like) column: a source
+    cell's raw count isn't comparable across neighbors of different sizes,
+    and blending raw counts directly to a much smaller destination cell
+    (as with H3 resolution 8 -> 9, where each finer cell is ~1/7 the area)
+    would hand it a value sized for the *source's* area, inflating its
+    ``.density`` several-fold. With ``density=True``, each neighbor's value
+    is divided by that neighbor's own area before blending, and the
+    blended density is scaled back up by the destination row's own
+    (smaller) area, so counts stay proportionate to cell size. Leave it
+    ``False`` for columns that are already an intensive quantity (medians,
+    rates, per-capita figures), which don't need this conversion.
+
+    Warning:
+        Only verified for the downscale direction (its intended use). If a
+        column combining this strategy is ever upscaled through the same
+        edge, the id-mapping mode this strategy selects (``"knn"``)
+        currently applies uniformly to both directions, which has not been
+        validated against ``upscale_aggs``'s expectations.
+
+    Attributes:
+        k: Number of nearest source neighbors blended per destination row.
+        power: Inverse-distance weighting exponent.
+        density: Whether to blend in per-area density space, converting
+            back to a magnitude sized for the destination row afterward.
+    """
+
+    def __init__(self, k: int = 6, power: float = 2.0, density: bool = False) -> None:
+        """Initialize the strategy.
+
+        Args:
+            k: Number of nearest source neighbors to blend.
+            power: Inverse-distance weighting exponent; higher values
+                concentrate more weight on the nearest neighbor(s).
+            density: Whether ``columns`` hold additive counts that should
+                be blended as densities (see class docstring) rather than
+                blended as-is.
+        """
+        # An absolute count (density=True) has a real total to preserve;
+        # a relative/intensive column (density=False, e.g. a median) doesn't.
+        super().__init__(geoweighted=True, mapping="knn", preserve_total=density)
+        self.knn_k = k
+        self.knn_power = power
+        self.density = density
+
+    def upscale_aggs(self, columns: List[str]) -> List[pl.Expr]:
+        return [pl.col(c).fill_nan(None).mean().alias(c) for c in columns]
+
+    def downscale_exprs(self, columns: List[str], group_col: str) -> List[pl.Expr]:
+        # The actual blend happens in consolidate_downscale, which needs
+        # the raw value, "_geoweight", and (if density=True) the area
+        # columns from get_knn_mapping -- so there is nothing to
+        # precompute per row here.
+        return []
+
+    def consolidate_downscale(self, columns: List[str]) -> List[pl.Expr]:
+        # Null neighbors are ignored and the remaining weights renormalized
+        # (mirroring mean_agg/mean_expr's null handling elsewhere in this
+        # module), so a destination cell with at least one non-null
+        # neighbor gets a proper weighted average of just those, and a
+        # destination cell whose neighbors are *all* null gets null back --
+        # not 0, which is what a plain ``.sum()`` over an all-null group
+        # would otherwise silently produce.
+        exprs = []
+        for c in columns:
+            # Each joined row's value belongs to a neighbor (the source of
+            # propagation), so density conversion divides by *that* row's
+            # area; the blended density is then scaled by the destination
+            # row's own area (the same value for every row in this group).
+            v = pl.col(c) / pl.col("_neighbor_area") if self.density else pl.col(c)
+            w = pl.col("_geoweight")
+            mask = v.is_not_null()
+            sum_w = w.filter(mask).sum()
+            weighted_sum = (v * w).filter(mask).sum()
+            avg = pl.when(sum_w > 0).then(weighted_sum / sum_w).otherwise(None)
+            if self.density:
+                avg = avg * pl.col("_query_area").first()
+            exprs.append(avg.alias(c))
         return exprs
 
 

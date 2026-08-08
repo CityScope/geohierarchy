@@ -10,6 +10,7 @@ and a real-file integration pipeline.
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import geopandas as gpd
 import polars as pl
 import pytest
@@ -18,8 +19,15 @@ from affine import Affine
 from shapely.geometry import box, Point, LineString
 
 from geohierarchy.core import GeoHierarchy
-from geohierarchy.aggregation import Sum, Mean, Max, Min
-from geohierarchy.utils import h3_cells
+from geohierarchy.aggregation import (
+    Sum,
+    Mean,
+    Max,
+    Min,
+    SmoothMean,
+    aggregation_strategy,
+)
+from geohierarchy.utils import h3_cells, get_knn_mapping
 
 TEST_FILES = Path(__file__).parent / "test_files"
 
@@ -421,6 +429,77 @@ def test_no_overwrite_of_native_values(region_gdf, city_gdf):
     assert gh.levels["city"]["population"].to_list() == [999, 999]
     # region should have received the aggregate, not overwritten city's values
     assert gh.levels["region"]["population"][0] == 1998
+
+
+# ============================================================
+# NULL BACKFILL (NATIVE NULLS ONLY)
+# ============================================================
+
+
+def test_null_native_backfilled_from_parent_leaves_real_values_untouched(
+    region_gdf, city_gdf
+):
+    """A native-but-null value is filled by downscaling from the parent; real values are untouched."""
+    gh = GeoHierarchy()
+    gh.add_level("region", region_gdf, id_col="reg_id")
+    gh.add_level("city", city_gdf, id_col="city_id", parent="region")
+
+    # city A is missing a value (null); city B has a real one.
+    gh.levels["city"] = gh.levels["city"].with_columns(
+        pl.Series("population", [None, 999.0])
+    )
+    gh.set_aggregation("population", Sum())
+
+    # region's aggregate ignores the null (upscale masking), so it's just B's 999.
+    assert gh.levels["region"]["population"][0] == 999.0
+    # city B's real value must survive untouched.
+    assert gh.levels["city"]["population"][1] == 999.0
+    # city A's null must be backfilled (region's total split across both matched cities), not left null.
+    assert gh.levels["city"]["population"][0] == pytest.approx(499.5)
+
+
+def test_null_backfill_cascades_through_multiple_levels(region_gdf, city_gdf, hood_gdf):
+    """A null several levels down gets filled through a chain of backfilled parents, one hop at a time."""
+    gh = GeoHierarchy()
+    gh.add_level("region", region_gdf, id_col="reg_id")
+    gh.add_level("city", city_gdf, id_col="city_id", parent="region")
+    gh.add_level("hood", hood_gdf, id_col="hood_id", parent="city")
+
+    gh.levels["region"] = gh.levels["region"].with_columns(
+        pl.Series("population", [1000.0])
+    )
+    gh.levels["city"] = gh.levels["city"].with_columns(
+        pl.Series("population", [None, None])
+    )
+    gh.levels["hood"] = gh.levels["hood"].with_columns(
+        pl.Series("population", [None, 5.0, 6.0, 7.0])
+    )
+    gh.set_aggregation("population", Sum())
+
+    # both cities were entirely null, so both get an equal share of the region.
+    assert gh.levels["city"]["population"].to_list() == [500.0, 500.0]
+    # hood n1 (under city A) had no value of its own, so it's backfilled from
+    # city A's now-filled value; hoods n2-n4's real values are untouched.
+    assert gh.levels["hood"]["population"].to_list() == [250.0, 5.0, 6.0, 7.0]
+
+
+def test_null_backfill_uses_broadcast_for_strategies_with_no_proportional_downscale(
+    region_gdf, city_gdf
+):
+    """Max has no proportional downscale, but backfill can still broadcast the parent's value down."""
+    gh = GeoHierarchy()
+    gh.add_level("region", region_gdf, id_col="reg_id")
+    gh.add_level("city", city_gdf, id_col="city_id", parent="region")
+
+    gh.levels["region"] = gh.levels["region"].with_columns(pl.Series("peak", [50.0]))
+    gh.levels["city"] = gh.levels["city"].with_columns(pl.Series("peak", [None, 10.0]))
+    gh.set_aggregation("peak", Max())
+
+    # city's null is backfilled by broadcasting the region's peak down
+    # (Max's own downscale, used identically by ordinary propagation);
+    # city's real value is untouched.
+    assert gh.levels["city"]["peak"][0] == 50.0
+    assert gh.levels["city"]["peak"][1] == 10.0
 
 
 # ============================================================
@@ -846,3 +925,326 @@ def test_real_pipeline():
     assert abs(tract_veh - county_veh) / (county_veh + 1e-9) < 0.01
     assert abs(tract_veh - blockgroup_veh) / (blockgroup_veh + 1e-9) < 0.01
     assert abs(tract_veh - block_veh) / (block_veh + 1e-9) < 0.01
+
+
+# ============================================================
+# SMOOTHMEAN (KNN-BLENDED DOWNSCALE)
+# ============================================================
+
+
+@pytest.fixture
+def two_source_gdf():
+    """Two side-by-side coarse cells, centroids at x=5 and x=15."""
+    return gpd.GeoDataFrame(
+        {"id": ["L", "R"], "value": [100.0, 0.0]},
+        geometry=[box(0, 0, 10, 10), box(10, 0, 20, 10)],
+        crs="EPSG:4326",
+    )
+
+
+@pytest.fixture
+def between_fine_gdf():
+    """Ten fine cells strictly between the two coarse centroids (x in [5, 15))."""
+    return gpd.GeoDataFrame(
+        {"fid": [f"f{i:02d}" for i in range(10)]},
+        geometry=[box(5 + i, 0, 6 + i, 10) for i in range(10)],
+        crs="EPSG:4326",
+    )
+
+
+def test_get_knn_mapping_weights_sum_to_one_per_src_row(
+    two_source_gdf, between_fine_gdf
+):
+    mapping = get_knn_mapping(
+        between_fine_gdf, two_source_gdf, "fid", "id", k=2, power=2.0
+    )
+    sums = mapping.group_by("fid").agg(pl.col("_geoweight").sum().alias("s"))
+    assert sums["s"].to_list() == pytest.approx([1.0] * 10, abs=1e-9)
+
+
+def test_get_knn_mapping_closer_neighbor_gets_more_weight(
+    two_source_gdf, between_fine_gdf
+):
+    mapping = get_knn_mapping(
+        between_fine_gdf, two_source_gdf, "fid", "id", k=2, power=2.0
+    )
+    # f00 spans x=[5,6), centroid closer to L (x=5) than R (x=15).
+    row = mapping.filter(pl.col("fid") == "f00")
+    weight_by_id = dict(zip(row["id"].to_list(), row["_geoweight"].to_list()))
+    assert weight_by_id["L"] > weight_by_id["R"]
+
+
+def test_smoothmean_produces_continuous_gradient_at_source_boundary(
+    two_source_gdf, between_fine_gdf
+):
+    """SmoothMean blends the two source values smoothly; a hard-overlap downscale would step instead."""
+    gh = GeoHierarchy()
+    gh.add_level("coarse", two_source_gdf, id_col="id", agg=Sum())
+    gh.add_level("fine", between_fine_gdf, id_col="fid", parent="coarse")
+    gh.set_aggregation("value", upscale=Sum(), downscale=SmoothMean(k=2))
+
+    result = gh.levels["fine"].sort("fid")
+    values = result["value"].to_list()
+
+    # Every fine cell is strictly between the two source values -- never
+    # exactly 100 or 0, unlike a hard geometric-overlap downscale would give.
+    assert all(0 < v < 100 for v in values)
+    # Monotonically non-increasing from the cell nearest L (f00) to the one
+    # nearest R (f09): a smooth gradient, not a discontinuous jump partway.
+    assert all(a >= b for a, b in zip(values, values[1:]))
+    # The cell closest to L should be noticeably higher than the one closest to R.
+    assert values[0] > values[-1] + 50
+
+
+def test_smoothmean_vs_overlap_downscale_at_the_same_boundary(
+    two_source_gdf, between_fine_gdf
+):
+    """Contrast: a plain Sum's overlap downscale gives a hard step; SmoothMean doesn't."""
+    hard = GeoHierarchy()
+    hard.add_level("coarse", two_source_gdf, id_col="id", agg=Sum())
+    hard.add_level("fine", between_fine_gdf, id_col="fid", parent="coarse")
+    hard_values = hard.levels["fine"].sort("fid")["value"].to_list()
+
+    # Sum's proportional split reproduces the source boundary exactly: L's
+    # total splits only across its own 5 overlapping cells, R's only across
+    # its own -- a hard step at the boundary, cells only ever see one side.
+    assert hard_values == pytest.approx([20.0] * 5 + [0.0] * 5)
+
+    smooth = GeoHierarchy()
+    smooth.add_level("coarse", two_source_gdf, id_col="id", agg=SmoothMean(k=2))
+    smooth.add_level("fine", between_fine_gdf, id_col="fid", parent="coarse")
+    smooth_values = smooth.levels["fine"].sort("fid")["value"].to_list()
+
+    # SmoothMean's cell nearest the boundary on the R side (f05) is still
+    # pulled up above 0 by L's influence, unlike the hard split's flat 0s.
+    assert smooth_values[5] > hard_values[5]
+
+
+def test_smoothmean_native_null_backfill_uses_knn_mapping():
+    """_fill_native_nulls respects a SmoothMean column's knn mapping mode, not overlap."""
+    coarse = gpd.GeoDataFrame(
+        {"id": ["L", "R"], "value": [100.0, 0.0]},
+        geometry=[box(0, 0, 10, 10), box(10, 0, 20, 10)],
+        crs="EPSG:4326",
+    )
+    fine = gpd.GeoDataFrame(
+        {"fid": ["f0", "f1"], "value": [None, 40.0]},
+        geometry=[box(9, 0, 10, 10), box(10, 0, 11, 10)],
+        crs="EPSG:4326",
+    )
+
+    gh = GeoHierarchy()
+    gh.add_level("coarse", coarse, id_col="id")
+    gh.add_level("fine", fine, id_col="fid", parent="coarse")
+    gh.set_aggregation("value", upscale=Sum(), downscale=SmoothMean(k=2))
+
+    result = gh.levels["fine"].sort("fid")
+    # f0's null must be backfilled (not left null), and since it's a blend
+    # of L and R rather than a straight copy of L, it should land strictly
+    # below L's 100 and shouldn't collide exactly with f1's real 40.0.
+    filled = result["value"][0]
+    assert filled is not None
+    assert 0 < filled < 100
+    assert result["value"][1] == 40.0
+
+
+def test_smoothmean_ignores_null_neighbors_and_renormalizes(
+    two_source_gdf, between_fine_gdf
+):
+    """A null source neighbor is dropped, not treated as 0 -- the rest is renormalized."""
+    coarse = two_source_gdf.copy()
+    coarse["value"] = [None, 50.0]  # only R is real; L is null
+
+    gh = GeoHierarchy()
+    gh.add_level("coarse", coarse, id_col="id", agg=SmoothMean(k=2))
+    gh.add_level("fine", between_fine_gdf, id_col="fid", parent="coarse")
+
+    values = gh.levels["fine"]["value"].to_list()
+    # With L null, every fine cell's only real neighbor is R (50.0). A naive
+    # sum of (value * weight) with the null contribution silently dropped
+    # (weights no longer summing to 1) would give something less than 50;
+    # ignoring L and renormalizing over R alone must give exactly 50.
+    assert values == pytest.approx([50.0] * 10)
+
+
+def test_smoothmean_all_null_neighbors_gives_null_not_zero(
+    two_source_gdf, between_fine_gdf
+):
+    """If every source neighbor is null, the result must be null -- not 0."""
+    coarse = two_source_gdf.copy()
+    coarse["value"] = pd.array([None, None], dtype="float64")
+
+    gh = GeoHierarchy()
+    gh.add_level("coarse", coarse, id_col="id", agg=SmoothMean(k=2))
+    gh.add_level("fine", between_fine_gdf, id_col="fid", parent="coarse")
+
+    values = gh.levels["fine"]["value"].to_list()
+    assert all(v is None for v in values)
+
+
+def test_smoothmean_density_mode_preserves_density_not_raw_count():
+    """density=True keeps a fine cell's density comparable to its coarse source, not inflated.
+
+    Fine cells fully tile the coarse cell's extent here (a realistic
+    downscale, like H3 res 8 -> 9), so density fidelity and total
+    preservation both hold at once -- see
+    test_smoothmean_total_preserved_even_with_partial_destination_coverage
+    for what happens when they don't.
+    """
+    coarse = gpd.GeoDataFrame(
+        {"id": ["C"], "population": [700.0]},
+        geometry=[box(0, 0, 10, 10)],  # area = 100
+        crs="EPSG:4326",
+    )
+    fine = gpd.GeoDataFrame(
+        {"fid": [f"f{i}" for i in range(10)]},
+        geometry=[
+            box(i, 0, i + 1, 10) for i in range(10)
+        ],  # area = 10 each, tiles [0, 10)
+        crs="EPSG:4326",
+    )
+
+    raw = GeoHierarchy()
+    raw.add_level("coarse", coarse, id_col="id", agg=SmoothMean(k=1, density=False))
+    raw.add_level("fine", fine, id_col="fid", parent="coarse")
+    raw_values = raw.levels["fine"]["population"].to_list()
+    # Without density conversion, each fine cell just inherits the coarse
+    # cell's raw population -- 10x too much for its 1/10th-sized area.
+    assert raw_values == pytest.approx([700.0] * 10)
+
+    smooth = GeoHierarchy()
+    smooth.add_level("coarse", coarse, id_col="id", agg=SmoothMean(k=1, density=True))
+    smooth.add_level("fine", fine, id_col="fid", parent="coarse")
+    smooth_values = smooth.levels["fine"]["population"].to_list()
+    # With density conversion, each fine cell gets a share proportional to
+    # its own (1/10th) area, keeping density consistent with the source --
+    # and since the fine grid fully tiles the coarse cell, the total
+    # rescale (always on for density=True) is a near no-op here.
+    # (rel tolerance: "area" reprojects EPSG:4326 degrees to UTM meters, so
+    # coordinate-unit ratios only hold approximately, not bit-exactly.)
+    assert smooth_values == pytest.approx([70.0] * 10, rel=0.01)
+    assert sum(smooth_values) == pytest.approx(700.0, rel=0.01)
+
+
+def test_smoothmean_total_preserved_even_with_partial_destination_coverage():
+    """When totals must be preserved, a smaller destination footprint doesn't shrink the total.
+
+    This is the flip side of the previous test: a single tiny destination
+    cell that only partially overlaps its (much larger) source neighbors'
+    combined footprint. preserve_total wins -- the point of this feature --
+    even though that means this one cell absorbs the full source total
+    rather than a locally-plausible density-based share.
+    """
+    coarse = gpd.GeoDataFrame(
+        {"id": ["big", "small"], "population": [1000.0, 10.0]},
+        geometry=[box(0, 0, 10, 10), box(10, 0, 11, 10)],
+        crs="EPSG:4326",
+    )
+    fine = gpd.GeoDataFrame(
+        {"fid": ["f0"]},
+        geometry=[box(5, 4, 6, 6)],  # tiny cell, area = 2, the *only* destination row
+        crs="EPSG:4326",
+    )
+
+    gh = GeoHierarchy()
+    gh.add_level("coarse", coarse, id_col="id", agg=SmoothMean(k=2, density=True))
+    gh.add_level("fine", fine, id_col="fid", parent="coarse")
+
+    value = gh.levels["fine"]["population"][0]
+    # This is the only destination row, so the rescale forces it to absorb
+    # the entire combined source total (1000 + 10 = 1010).
+    assert value == pytest.approx(1010.0, rel=0.01)
+
+
+def test_smoothmean_density_mode_preserves_total_while_still_blending():
+    """With full destination coverage, the total is preserved *and* a smooth gradient survives."""
+    coarse = gpd.GeoDataFrame(
+        {"id": ["L", "R"], "population": [100.0, 200.0]},
+        # L density = 1/unit^2, R density = 2/unit^2, combined total = 300.
+        geometry=[box(0, 0, 10, 10), box(10, 0, 20, 10)],
+        crs="EPSG:4326",
+    )
+    fine = gpd.GeoDataFrame(
+        {"fid": [f"f{i:02d}" for i in range(20)]},
+        geometry=[box(i, 0, i + 1, 10) for i in range(20)],  # tiles [0, 20) exactly
+        crs="EPSG:4326",
+    )
+
+    gh = GeoHierarchy()
+    gh.add_level("coarse", coarse, id_col="id", agg=SmoothMean(k=2, density=True))
+    gh.add_level("fine", fine, id_col="fid", parent="coarse")
+
+    values = gh.levels["fine"].sort("fid")["population"].to_list()
+
+    # Total preserved despite the spatial blend.
+    assert sum(values) == pytest.approx(300.0, rel=0.01)
+    # Monotonic between the two source centroids (x=5 to x=15, i.e. cells
+    # f05-f14): a smooth gradient, not a hard step -- the rescale is a
+    # single uniform factor across all rows, so it can't undo the blend.
+    between_centroids = values[5:15]
+    assert all(a <= b + 1e-6 for a, b in zip(between_centroids, between_centroids[1:]))
+    # And overall, the R (higher-density) side is still clearly higher than the L side.
+    assert sum(values[:5]) < sum(values[-5:])
+
+
+# ============================================================
+# PRESERVE_TOTAL (RESAMPLING TOTALS VS. RELATIVE COLUMNS)
+# ============================================================
+
+
+def test_sum_marks_preserve_total_true():
+    assert Sum().preserve_total is True
+
+
+def test_mean_max_min_default_preserve_total_false():
+    assert Mean().preserve_total is False
+    assert Max().preserve_total is False
+    assert Min().preserve_total is False
+
+
+def test_smoothmean_preserve_total_follows_density_flag():
+    assert SmoothMean(density=True).preserve_total is True
+    assert SmoothMean(density=False).preserve_total is False
+
+
+def test_aggregation_strategy_carries_preserve_total_from_downscale():
+    combined = aggregation_strategy(upscale=Mean(), downscale=SmoothMean(density=True))
+    assert combined.preserve_total is True
+
+    combined2 = aggregation_strategy(upscale=Sum(), downscale=SmoothMean(density=False))
+    assert combined2.preserve_total is False
+
+
+def test_relative_column_total_is_not_forced_to_match(two_source_gdf, between_fine_gdf):
+    """A relative/intensive column (SmoothMean with density=False) is left un-rescaled."""
+    gh = GeoHierarchy()
+    gh.add_level(
+        "coarse", two_source_gdf, id_col="id", agg=SmoothMean(k=2, density=False)
+    )
+    gh.add_level("fine", between_fine_gdf, id_col="fid", parent="coarse")
+
+    values = gh.levels["fine"]["value"].to_list()
+    coarse_total = two_source_gdf["value"].sum()  # 100.0
+    # An income-like column has no meaningful "total" to preserve -- summing
+    # ten blended medians must NOT be forced to equal the two sources' sum.
+    assert sum(values) != pytest.approx(coarse_total, rel=0.05)
+
+
+def test_count_column_total_is_forced_to_match_even_when_blend_alone_would_drift():
+    """An absolute count column (SmoothMean with density=True) always matches its source total."""
+    coarse = gpd.GeoDataFrame(
+        {"id": ["L", "R"], "jobs": [300.0, 150.0]},
+        geometry=[box(0, 0, 10, 10), box(10, 0, 20, 10)],
+        crs="EPSG:4326",
+    )
+    fine = gpd.GeoDataFrame(
+        {"fid": [f"f{i:02d}" for i in range(20)]},
+        geometry=[box(i, 0, i + 1, 10) for i in range(20)],
+        crs="EPSG:4326",
+    )
+
+    gh = GeoHierarchy()
+    gh.add_level("coarse", coarse, id_col="id", agg=SmoothMean(k=2, density=True))
+    gh.add_level("fine", fine, id_col="fid", parent="coarse")
+
+    assert gh.levels["fine"]["jobs"].sum() == pytest.approx(450.0, rel=0.01)

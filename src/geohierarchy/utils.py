@@ -327,6 +327,100 @@ def get_id_mapping(
     return pl.from_pandas(mapping)
 
 
+def get_knn_mapping(
+    src_gdf: gpd.GeoDataFrame,
+    dst_gdf: gpd.GeoDataFrame,
+    src_id: str,
+    dst_id: str,
+    k: int = 6,
+    power: float = 2.0,
+) -> pl.DataFrame:
+    """Build an inverse-distance-weighted k-nearest-neighbor mapping, for smoothed downscaling.
+
+    Unlike :func:`get_id_mapping` (which only pairs geometries that
+    physically overlap, reproducing the source geometry's boundaries
+    exactly), this pairs every ``src_gdf`` centroid with its ``k`` nearest
+    ``dst_gdf`` centroids, weighted by inverse distance and normalized to
+    sum to 1 within each ``src_id`` group. Used by
+    :class:`~geohierarchy.aggregation.SmoothMean` so a downscaled value
+    blends across several source cells instead of copying whichever one
+    happens to contain (or nearly contain) a given destination cell,
+    smoothing out the source geometry's hard boundaries.
+
+    Also computes each row's polygon area (reusing an existing ``"area"``
+    column if either GeoDataFrame already has one -- e.g. the ``"area"``
+    column :class:`~geohierarchy.core.GeoHierarchy` stores on every level's
+    geometry table -- rather than recomputing it) and carries it along as
+    ``"_query_area"`` (area of the ``src_gdf`` row each mapping row is
+    computed *for*) and ``"_neighbor_area"`` (area of the paired
+    ``dst_gdf`` neighbor). :class:`~geohierarchy.aggregation.SmoothMean`
+    uses these to convert an additive count to a density (dividing by
+    whichever side the value's own row is on) before blending, and back to
+    a count sized for the row being computed afterward. Meaningless (and
+    unused) for non-polygon geometries.
+
+    Args:
+        src_gdf: Rows to compute neighbor weights for (the finer,
+            "destination-of-propagation" geometries in a downscale).
+        dst_gdf: Candidate neighbor geometries (the coarser,
+            "source-of-propagation" geometries in a downscale).
+        src_id: Id column in ``src_gdf``.
+        dst_id: Id column in ``dst_gdf``.
+        k: Number of nearest ``dst_gdf`` neighbors to blend per ``src_gdf`` row.
+        power: Inverse-distance weighting exponent; higher values
+            concentrate more weight on the nearest neighbor(s).
+
+    Returns:
+        Polars DataFrame with ``[src_id, dst_id, "_geoweight", "_query_area",
+        "_neighbor_area"]``; ``"_geoweight"`` sums to 1 within each ``src_id`` group.
+    """
+    src = src_gdf[[src_id, "geometry"]].copy()
+    dst = dst_gdf[[dst_id, "geometry"]].copy()
+    if src.crs != dst.crs:
+        dst = dst.to_crs(src.crs)
+
+    query_areas = (
+        src_gdf["area"] if "area" in src_gdf.columns else area(src_gdf)
+    ).to_numpy()
+    neighbor_areas = (
+        dst_gdf["area"] if "area" in dst_gdf.columns else area(dst_gdf)
+    ).to_numpy()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        src_xy = np.column_stack([src.geometry.centroid.x, src.geometry.centroid.y])
+        dst_xy = np.column_stack([dst.geometry.centroid.x, dst.geometry.centroid.y])
+
+    k = max(1, min(k, len(dst_xy)))
+    # Brute-force distance matrix: fine for the level sizes geohierarchy operates at.
+    dist = np.sqrt(((src_xy[:, None, :] - dst_xy[None, :, :]) ** 2).sum(axis=2))
+    nn_idx = np.argsort(dist, axis=1)[:, :k]
+    nn_dist = np.take_along_axis(dist, nn_idx, axis=1)
+
+    eps = (
+        1e-9  # avoid division by zero when a src centroid coincides with a dst centroid
+    )
+    weights = 1.0 / np.power(nn_dist + eps, power)
+    weights = weights / weights.sum(axis=1, keepdims=True)
+
+    n_src, kk = nn_idx.shape
+    src_ids = np.repeat(src[src_id].to_numpy(), kk)
+    dst_ids = dst[dst_id].to_numpy()[nn_idx.ravel()]
+    geoweights = weights.ravel()
+    query_area_col = np.repeat(query_areas, kk)
+    neighbor_area_col = neighbor_areas[nn_idx.ravel()]
+
+    return pl.DataFrame(
+        {
+            src_id: src_ids,
+            dst_id: dst_ids,
+            "_geoweight": geoweights,
+            "_query_area": query_area_col,
+            "_neighbor_area": neighbor_area_col,
+        }
+    )
+
+
 def h3_cells(
     geometry: "gpd.GeoDataFrame | gpd.GeoSeries", resolution: int
 ) -> gpd.GeoDataFrame:

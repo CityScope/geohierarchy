@@ -17,6 +17,10 @@ dependencies = [
     "shapely>=2.0.0",
     "httpx>=0.27.0", # For GBaseClient async operations
     "pandas>=2.3.3",
+    "folium>=0.16.0",
+    "branca>=0.7.0",
+    "mercantile>=1.2.1",
+    "mapbox-vector-tile>=2.0.1",
 ]
 
 [build-system]

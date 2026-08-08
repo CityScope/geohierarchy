@@ -5,8 +5,11 @@ Key rules:
     - Only user-defined attribute columns propagate.
     - Every propagating column must resolve to exactly one aggregation
       strategy for the level it propagates from.
-    - A level's native (user-provided) values are never overwritten by
-      propagation.
+    - A level's native (user-provided) non-null values are never
+      overwritten by propagation. Null native values are the one
+      exception: they are backfilled from a parent level (downscaled),
+      since a null means "no value collected here", not "a real value
+      of nothing" -- see :meth:`GeoHierarchy._fill_native_nulls`.
 """
 
 from __future__ import annotations
@@ -20,7 +23,13 @@ import geopandas as gpd
 import polars as pl
 from pyproj import CRS
 
-from .utils import vectorize_raster_polars, get_id_mapping, area, length
+from .utils import (
+    vectorize_raster_polars,
+    get_id_mapping,
+    get_knn_mapping,
+    area,
+    length,
+)
 from .aggregation import AggregationStrategy, aggregation_strategy
 
 
@@ -637,6 +646,7 @@ class GeoHierarchy:
 
         self._propagate_columns(columns, upscale=True)
         self._propagate_columns(columns, upscale=False)
+        self._fill_native_nulls(columns)
 
         for c in columns:
             missing_levels = all_levels - self.columns[c]["levels"]
@@ -751,40 +761,112 @@ class GeoHierarchy:
         if not resolved_columns:
             return []
 
-        columns = resolved_columns
-        geoweighted = any(agg.geoweighted for agg in aggs)
+        # Columns can mix mapping modes (e.g. a plain Sum column and a
+        # SmoothMean column reaching the same edge in the same pass), so
+        # each mode gets its own mapping and its own join/aggregate step.
+        by_mapping: Dict[str, tuple] = {}
+        for col, agg in zip(resolved_columns, aggs):
+            by_mapping.setdefault(agg.mapping, ([], []))
+            by_mapping[agg.mapping][0].append(col)
+            by_mapping[agg.mapping][1].append(agg)
 
-        if upscale:
-            cache_key = (
-                f"_id_mapping_{src}_{dst}_{geoweighted}_{self.geoweight_by[src]}"
+        results = []
+        for mode, (mode_columns, mode_aggs) in by_mapping.items():
+            mapping = self._get_or_build_mapping(mode, mode_aggs, src, dst, upscale)
+            results.append(
+                self._aggregate_edge_batch(
+                    mode_columns, mode_aggs, mapping, src, dst, upscale
+                )
             )
-            mapping_args = (
+
+        result = results[0]
+        for extra in results[1:]:
+            result = result.join(extra, on=self.id_cols[dst], how="full", coalesce=True)
+
+        self.levels[dst] = self.levels[dst].join(
+            result.select([self.id_cols[dst], *resolved_columns]),
+            on=self.id_cols[dst],
+            how="left",
+        )
+
+        return resolved_columns
+
+    def _get_or_build_mapping(
+        self,
+        mode: str,
+        aggs: List[AggregationStrategy],
+        src: str,
+        dst: str,
+        upscale: bool,
+    ) -> pl.DataFrame:
+        """Build (and cache) the id mapping for one mapping mode ("overlap" or "knn").
+
+        Args:
+            mode: ``"overlap"`` or ``"knn"``.
+            aggs: Strategies sharing this mode for the current batch --
+                used to read ``geoweighted``/``knn_k``/``knn_power``.
+            src: Source level name.
+            dst: Destination level name.
+            upscale: Propagation direction.
+
+        Returns:
+            The mapping DataFrame for this mode.
+        """
+        if upscale:
+            geo_a, geo_b, id_a, id_b = (
                 self.geometries[src],
                 self.geometries[dst],
                 self.id_cols[src],
                 self.id_cols[dst],
-                self.geoweight_by[src],
             )
         else:
-            cache_key = (
-                f"_id_mapping_{dst}_{src}_{geoweighted}_{self.geoweight_by[dst]}"
-            )
-            mapping_args = (
+            geo_a, geo_b, id_a, id_b = (
                 self.geometries[dst],
                 self.geometries[src],
                 self.id_cols[dst],
                 self.id_cols[src],
-                self.geoweight_by[dst],
             )
 
-        if cache_key not in self._mapping_cache:
-            geo_a, geo_b, id_a, id_b, how = mapping_args
-            self._mapping_cache[cache_key] = get_id_mapping(
-                geo_a, geo_b, id_a, id_b, geoweighted=geoweighted, how=how
-            )
+        if mode == "knn":
+            agg = aggs[0]
+            cache_key = f"_knn_mapping_{id_a}_{id_b}_{agg.knn_k}_{agg.knn_power}"
+            if cache_key not in self._mapping_cache:
+                self._mapping_cache[cache_key] = get_knn_mapping(
+                    geo_a, geo_b, id_a, id_b, k=agg.knn_k, power=agg.knn_power
+                )
+        else:
+            geoweighted = any(agg.geoweighted for agg in aggs)
+            how = self.geoweight_by[src] if upscale else self.geoweight_by[dst]
+            cache_key = f"_id_mapping_{id_a}_{id_b}_{geoweighted}_{how}"
+            if cache_key not in self._mapping_cache:
+                self._mapping_cache[cache_key] = get_id_mapping(
+                    geo_a, geo_b, id_a, id_b, geoweighted=geoweighted, how=how
+                )
 
-        mapping = self._mapping_cache[cache_key]
+        return self._mapping_cache[cache_key]
 
+    def _aggregate_edge_batch(
+        self,
+        columns: List[str],
+        aggs: List[AggregationStrategy],
+        mapping: pl.DataFrame,
+        src: str,
+        dst: str,
+        upscale: bool,
+    ) -> pl.DataFrame:
+        """Join ``src`` data through ``mapping`` and aggregate one batch of same-mode columns.
+
+        Args:
+            columns: Column names to aggregate, all sharing one mapping mode.
+            aggs: Their aggregation strategies, same order as ``columns``.
+            mapping: Id mapping for this batch, from :meth:`_get_or_build_mapping`.
+            src: Source level name.
+            dst: Destination level name.
+            upscale: Propagation direction.
+
+        Returns:
+            One row per destination id, with ``columns`` aggregated.
+        """
         selected_cols = set(columns)
         selected_cols.add(self.id_cols[src])
         for agg in aggs:
@@ -798,30 +880,196 @@ class GeoHierarchy:
             exprs = []
             for col, agg in zip(columns, aggs):
                 exprs += agg.upscale_aggs([col])
-            result = joined.group_by(self.id_cols[dst]).agg(exprs)
+            return joined.group_by(self.id_cols[dst]).agg(exprs)
+
+        exprs = []
+        for col, agg in zip(columns, aggs):
+            exprs += agg.downscale_exprs([col], self.id_cols[src])
+        result = joined.with_columns(exprs) if exprs else joined
+
+        # A destination row can overlap more than one source row (e.g. a
+        # street crossing two tracts, or several knn neighbors), which
+        # leaves one fragment row per source it overlaps here. Collapse
+        # those fragments back to a single row per destination id, letting
+        # each strategy decide how (Sum/SmoothMean add them, most others
+        # just keep one).
+        consolidate_exprs = []
+        for col, agg in zip(columns, aggs):
+            consolidate_exprs += agg.consolidate_downscale([col])
+        result = result.group_by(self.id_cols[dst]).agg(consolidate_exprs)
+
+        return self._rescale_to_preserve_totals(result, columns, aggs, src)
+
+    def _rescale_to_preserve_totals(
+        self,
+        result: pl.DataFrame,
+        columns: List[str],
+        aggs: List[AggregationStrategy],
+        src: str,
+    ) -> pl.DataFrame:
+        """Correct a downscaled column back to matching its source total, where required.
+
+        Most strategies (:class:`~geohierarchy.aggregation.Sum`'s proportional
+        split) already reproduce the source total exactly by construction.
+        :class:`~geohierarchy.aggregation.SmoothMean`'s spatial blending
+        doesn't -- it optimizes for a smooth surface, not an exact
+        partition -- so any column whose strategy has
+        ``preserve_total=True`` (an absolute/additive quantity, as opposed
+        to a relative one with no real total to preserve) gets uniformly
+        rescaled here so its grand total across ``result`` matches its
+        grand total in ``self.levels[src]``.
+
+        Args:
+            result: One row per destination id, columns already aggregated.
+            columns: Column names in ``result`` to consider.
+            aggs: Their aggregation strategies, same order as ``columns``.
+            src: Source level name, to read the target total from.
+
+        Returns:
+            ``result`` with any ``preserve_total`` column rescaled in place.
+        """
+        rescale_exprs = []
+        for col, agg in zip(columns, aggs):
+            if not agg.preserve_total:
+                continue
+
+            src_total = self.levels[src][col].sum()
+            dst_total = result[col].sum()
+            if not src_total or not dst_total:
+                continue
+
+            rescale_exprs.append((pl.col(col) * (src_total / dst_total)).alias(col))
+
+        return result.with_columns(rescale_exprs) if rescale_exprs else result
+
+    # ================================================================
+    # NULL BACKFILL (NATIVE NULLS ONLY)
+    # ================================================================
+
+    def _fill_native_nulls(self, columns: List[str]) -> None:
+        """Backfill null cells in a present column from a parent, leaving real values untouched.
+
+        A column can be present at a level (native, or already derived by
+        :meth:`_propagate_columns`) while still holding nulls -- e.g. a
+        source that legitimately has no value for some rows. Ordinary
+        propagation never revisits that column for this level, since
+        "present" is all it checks. This fills exactly the null rows, by
+        downscaling from a parent that has the column, without touching any
+        row that already holds a value. Runs coarsest-to-finest with a
+        worklist so a grandparent's values can cascade down through a
+        parent that itself just got backfilled.
+
+        Args:
+            columns: Propagatable column names to consider.
+        """
+        queue = deque(self.levels.keys())
+        queued = set(queue)
+
+        while queue:
+            lev = queue.popleft()
+            queued.discard(lev)
+            changed = False
+
+            for col in columns:
+                if col not in self.levels[lev].columns:
+                    continue
+                remaining = self.levels[lev][col].null_count()
+                if remaining == 0:
+                    continue
+
+                for parent in self.parents.get(lev, ()):
+                    if (
+                        parent not in self.levels
+                        or col not in self.levels[parent].columns
+                    ):
+                        continue
+                    agg = self._require_agg(col, parent, _raise=False)
+                    if agg is None:
+                        continue
+
+                    filled = self._downscale_fill_column(col, agg, src=parent, dst=lev)
+                    new_remaining = filled[col].null_count()
+                    if new_remaining < remaining:
+                        self.levels[lev] = filled
+                        changed = True
+                        remaining = new_remaining
+                    if remaining == 0:
+                        break
+
+            if changed:
+                for child in self.children.get(lev, ()):
+                    if child in self.levels and child not in queued:
+                        queue.append(child)
+                        queued.add(child)
+
+    def _downscale_fill_column(
+        self, col: str, agg: AggregationStrategy, src: str, dst: str
+    ) -> pl.DataFrame:
+        """Compute ``col``'s downscaled values from ``src`` and coalesce them into ``dst``'s nulls.
+
+        Args:
+            col: Column to fill.
+            agg: Aggregation strategy registered for ``col`` at ``src``.
+                Its ``mapping`` mode (``"overlap"`` or ``"knn"``) picks
+                which id-mapping function pairs the rows.
+            src: Parent level to downscale from.
+            dst: Level whose null ``col`` rows should be filled.
+
+        Returns:
+            ``dst``'s table with ``col``'s null rows filled wherever
+            ``src`` had a value to offer; non-null rows are unchanged.
+        """
+        if agg.mapping == "knn":
+            cache_key = f"_knn_mapping_{dst}_{src}_{agg.knn_k}_{agg.knn_power}"
+            if cache_key not in self._mapping_cache:
+                self._mapping_cache[cache_key] = get_knn_mapping(
+                    self.geometries[dst],
+                    self.geometries[src],
+                    self.id_cols[dst],
+                    self.id_cols[src],
+                    k=agg.knn_k,
+                    power=agg.knn_power,
+                )
         else:
-            exprs = []
-            for col, agg in zip(columns, aggs):
-                exprs += agg.downscale_exprs([col], self.id_cols[src])
-            result = joined.with_columns(exprs) if exprs else joined
+            cache_key = (
+                f"_id_mapping_{dst}_{src}_{agg.geoweighted}_{self.geoweight_by[dst]}"
+            )
+            if cache_key not in self._mapping_cache:
+                self._mapping_cache[cache_key] = get_id_mapping(
+                    self.geometries[dst],
+                    self.geometries[src],
+                    self.id_cols[dst],
+                    self.id_cols[src],
+                    geoweighted=agg.geoweighted,
+                    how=self.geoweight_by[dst],
+                )
+        mapping = self._mapping_cache[cache_key]
 
-            # A destination row can overlap more than one source row (e.g.
-            # a street crossing two tracts), which leaves one fragment row
-            # per source it overlaps here. Collapse those fragments back
-            # to a single row per destination id, letting each strategy
-            # decide how (Sum adds them, most others just keep one).
-            consolidate_exprs = []
-            for col, agg in zip(columns, aggs):
-                consolidate_exprs += agg.consolidate_downscale([col])
-            result = result.group_by(self.id_cols[dst]).agg(consolidate_exprs)
+        selected_cols = {col, self.id_cols[src]}
+        if getattr(agg, "weight_column", None):
+            selected_cols.add(agg.weight_column)
+        if not selected_cols.issubset(self.levels[src].columns):
+            return self.levels[dst]
 
-        self.levels[dst] = self.levels[dst].join(
-            result.select([self.id_cols[dst], *columns]),
-            on=self.id_cols[dst],
-            how="left",
+        data = self.levels[src].select(list(selected_cols))
+        joined = mapping.join(data, on=self.id_cols[src])
+
+        exprs = agg.downscale_exprs([col], self.id_cols[src])
+        candidate = joined.with_columns(exprs) if exprs else joined
+        consolidate_exprs = agg.consolidate_downscale([col])
+        candidate = candidate.group_by(self.id_cols[dst]).agg(consolidate_exprs)
+        candidate = candidate.select(
+            [self.id_cols[dst], pl.col(col).alias("_fill_candidate")]
         )
 
-        return columns
+        return (
+            self.levels[dst]
+            .join(candidate, on=self.id_cols[dst], how="left")
+            .with_columns(
+                pl.coalesce([pl.col(col), pl.col("_fill_candidate")]).alias(col)
+            )
+            .drop("_fill_candidate")
+        )
 
     # ================================================================
     # VECTOR INPUT (NON-LAYER DATA)
