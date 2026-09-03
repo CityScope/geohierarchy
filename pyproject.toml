@@ -15,12 +15,18 @@ dependencies = [
     "rasterio>=1.3.0",
     "fiona>=1.9.0",
     "shapely>=2.0.0",
-    "httpx>=0.27.0", # For GBaseClient async operations
+    "numpy>=1.24.0",
     "pandas>=2.3.3",
     "folium>=0.16.0",
     "branca>=0.7.0",
     "mercantile>=1.2.1",
     "mapbox-vector-tile>=2.0.1",
+    "scipy>=1.11.0",
+    "h3>=4.0.0",
+    "pyproj>=3.5.0",
+    "freestiler>=0.2.0",
+    "pmtiles>=3.7.0",
+    "tqdm>=4.67.1",
 ]
 
 [build-system]

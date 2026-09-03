@@ -15,7 +15,7 @@ Key rules:
 from __future__ import annotations
 
 from collections import deque
-from typing import Dict, Optional, Union, Any, Literal, Set, List
+from typing import Dict, Optional, Union, Any, Literal, Set, List, Sequence
 import warnings
 import numpy as np
 import pandas as pd
@@ -837,10 +837,22 @@ class GeoHierarchy:
         else:
             geoweighted = any(agg.geoweighted for agg in aggs)
             how = self.geoweight_by[src] if upscale else self.geoweight_by[dst]
-            cache_key = f"_id_mapping_{id_a}_{id_b}_{geoweighted}_{how}"
+            intersection_mode = next(
+                (agg.intersection_mode for agg in aggs if agg.intersection_mode),
+                None,
+            )
+            cache_key = (
+                f"_id_mapping_{id_a}_{id_b}_{geoweighted}_{how}_{intersection_mode}"
+            )
             if cache_key not in self._mapping_cache:
                 self._mapping_cache[cache_key] = get_id_mapping(
-                    geo_a, geo_b, id_a, id_b, geoweighted=geoweighted, how=how
+                    geo_a,
+                    geo_b,
+                    id_a,
+                    id_b,
+                    geoweighted=geoweighted,
+                    how=how,
+                    intersection_mode=intersection_mode,
                 )
 
         return self._mapping_cache[cache_key]
@@ -1033,6 +1045,7 @@ class GeoHierarchy:
         else:
             cache_key = (
                 f"_id_mapping_{dst}_{src}_{agg.geoweighted}_{self.geoweight_by[dst]}"
+                f"_{agg.intersection_mode}"
             )
             if cache_key not in self._mapping_cache:
                 self._mapping_cache[cache_key] = get_id_mapping(
@@ -1042,6 +1055,7 @@ class GeoHierarchy:
                     self.id_cols[src],
                     geoweighted=agg.geoweighted,
                     how=self.geoweight_by[dst],
+                    intersection_mode=agg.intersection_mode,
                 )
         mapping = self._mapping_cache[cache_key]
 
@@ -1085,6 +1099,9 @@ class GeoHierarchy:
         upscale: Optional[bool] = None,
         buffer: float = 0,
         fill_null: Union[int, float, Dict[str, Union[int, float]], None] = 0,
+        intersection_mode: Optional[
+            Literal["centroid", "touches", "exact", "intersects"]
+        ] = None,
     ) -> None:
         """Inject columns from an external (non-layer) vector dataset into a level.
 
@@ -1120,6 +1137,13 @@ class GeoHierarchy:
             fill_null: Value(s) used to fill nulls left after injection --
                 a scalar applied to every injected column, a per-column
                 mapping, or ``None`` to leave nulls as-is.
+            intersection_mode: Forwarded to :func:`get_id_mapping` --
+                overrides the legacy ``geoweighted``-derived default
+                ("exact" if geoweighted else "centroid"). Pass
+                ``"intersects"`` for a real geometry-touches test without
+                either the "centroid" mode's centroid-substitution
+                near-miss risk or "exact"'s much more expensive area-overlay
+                computation.
 
         Raises:
             Exception: If ``agg`` is not given.
@@ -1204,6 +1228,7 @@ class GeoHierarchy:
                 self.id_cols[level],
                 geoweighted=is_geoweighted,
                 how=geoweight_by,
+                intersection_mode=intersection_mode,
             )
         else:
             mapping = get_id_mapping(
@@ -1213,6 +1238,7 @@ class GeoHierarchy:
                 tid,
                 geoweighted=is_geoweighted,
                 how=geoweight_by,
+                intersection_mode=intersection_mode,
             )
 
         # Injecting a column resets its propagation state to just this level,
@@ -1356,20 +1382,68 @@ class GeoHierarchy:
     # ACCESS
     # ================================================================
 
-    def get_level(self, name: str) -> gpd.GeoDataFrame:
+    def get_level(
+        self, name: str, columns: Optional[Sequence[str]] = None
+    ) -> gpd.GeoDataFrame:
         """Return a level's geometry joined with its attribute table.
 
         Args:
             name: Name of the level to retrieve.
+            columns: If given, only these attribute columns (plus the id
+                column, always included) are pulled from the level's Polars
+                attribute table before the pandas merge/`.to_pandas()`
+                conversion -- e.g. a metro-scale H3 level can carry 100+
+                census/derived columns even though a given consumer (e.g.
+                vector-tile generation, which only needs `popup_fields` +
+                the active style column) uses only a handful. Selecting
+                first avoids materializing every column's full-length
+                pandas Series just to drop most of them a moment later.
+                `None` (default) keeps prior behavior: every stored
+                attribute column.
 
         Returns:
-            A GeoDataFrame combining the level's geometry with every
-            attribute column currently stored for it.
+            A GeoDataFrame combining the level's geometry with the
+            requested attribute columns (or all of them, if `columns` is
+            `None`).
         """
-        return self.geometries[name][[self.id_cols[name], "geometry"]].merge(
-            self.levels[name].to_pandas(),
-            on=self.id_cols[name],
+        id_col = self.id_cols[name]
+        attrs = self.levels[name]
+        if columns is not None:
+            keep = [id_col] + [
+                c for c in dict.fromkeys(columns) if c in attrs.columns and c != id_col
+            ]
+            attrs = attrs.select(keep)
+        return self.geometries[name][[id_col, "geometry"]].merge(
+            attrs.to_pandas(),
+            on=id_col,
         )
+
+    def level_bounds(self, name: str) -> tuple:
+        """Return a level's ``(minx, miny, maxx, maxy)`` extent, without materializing it.
+
+        :meth:`add_level` already stores per-feature ``minx``/``miny``/
+        ``maxx``/``maxy`` columns, so the level's extent is four Polars
+        aggregations over columns already in memory. Callers that only need
+        an extent (e.g. centering a map) previously went through
+        :meth:`get_level`, which re-joins geometry with the full attribute
+        table row by row -- gigabytes of work for four numbers on a
+        metro-scale level.
+
+        Args:
+            name: Name of the level.
+
+        Returns:
+            ``(minx, miny, maxx, maxy)`` in the hierarchy's CRS.
+        """
+        df = self.levels[name]
+        if all(c in df.columns for c in ("minx", "miny", "maxx", "maxy")):
+            return (
+                df["minx"].min(),
+                df["miny"].min(),
+                df["maxx"].max(),
+                df["maxy"].max(),
+            )
+        return tuple(self.geometries[name].total_bounds)
 
     def __getitem__(self, key: str) -> gpd.GeoDataFrame:
         """Alias for :meth:`get_level`, e.g. ``hierarchy["city"]``.

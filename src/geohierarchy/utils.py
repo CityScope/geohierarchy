@@ -244,6 +244,9 @@ def get_id_mapping(
     dst_id: str,
     geoweighted: bool = False,
     how: Optional[Literal["area", "length"]] = None,
+    intersection_mode: Optional[
+        Literal["centroid", "touches", "exact", "intersects"]
+    ] = None,
 ) -> pl.DataFrame:
     """
     Creates a mapping table between two geometry levels.
@@ -253,7 +256,51 @@ def get_id_mapping(
         dst_gdf (gpd.GeoDataFrame): Destination geometry (coarser).
         src_id (str): ID column in source layer.
         dst_id (str): ID column in destination layer.
-        geoweighted (bool): If True, computes area overlap fractions as 'geoweighted'.
+        geoweighted (bool): Legacy flag, kept for backward compatibility.
+            Ignored whenever ``intersection_mode`` is given explicitly;
+            otherwise ``True`` behaves like ``intersection_mode="exact"``
+            and ``False`` like ``intersection_mode="centroid"``.
+        how: ``"area"`` or ``"length"``, forwarded to the ``"exact"`` path.
+        intersection_mode: How ``src`` rows are paired with ``dst`` rows:
+
+            - ``"centroid"``: a source polygon belongs to whichever
+              destination polygon contains its centroid (this is the
+              original, cheap ``geoweighted=False`` behavior). Every
+              matched row gets ``_geoweight = 1.0``.
+            - ``"touches"``: a source geometry belongs to *every*
+              destination polygon that contains it (full containment, not
+              just border-touching). If a source row is contained by ``N``
+              destination rows, its ``_geoweight`` is ``1/N`` -- downstream
+              additive aggregations (e.g. :class:`~geohierarchy.aggregation.Sum`)
+              split its value across those ``N`` claims, while averaging
+              aggregations (e.g. :class:`~geohierarchy.aggregation.Mean`)
+              naturally average instead of divide, since the weights are
+              equal.
+            - ``"exact"``: like ``"touches"``, but ``_geoweight`` is the
+              real intersection area (or length) fraction between each
+              matched pair, not a plain ``1/N`` split (this is the
+              original ``geoweighted=True`` behavior).
+            - ``"intersects"``: a source geometry belongs to *every*
+              destination polygon it geometrically touches at all --
+              real ``predicate="intersects"`` on the original geometry, no
+              centroid substitution -- with every match getting
+              ``_geoweight = 1.0`` (no ``1/N`` split, no area-fraction
+              overlay). 2026-09-01 fix: this is what ``"centroid"`` was
+              always *meant* to approximate for a caller aggregating an
+              attribute like transit-access level_of_service onto census
+              polygons ("population weighted average of every hexagon cell
+              touching this polygon") -- a hexagon whose true footprint
+              overlaps a small/oddly-shaped polygon but whose *centroid*
+              happens to fall just outside it (common for census blocks
+              comparable in size to a single hexagon) was silently dropped
+              from that polygon's aggregate, which could paint a real
+              transit-served block with a wrong 0 despite every hexagon
+              actually covering it showing real access. Costs the same
+              index-based ``gpd.sjoin`` as ``"centroid"`` (no expensive
+              ``gpd.overlay``), so it is not the slow path ``"exact"`` is.
+
+            If ``None`` (default), falls back to the legacy ``geoweighted``
+            bool for backward compatibility.
 
     Returns:
         pl.DataFrame: Mapping table with [src_id, dst_id, geoweight].
@@ -264,7 +311,40 @@ def get_id_mapping(
     if src.crs != dst.crs:
         dst = dst.to_crs(src.crs)
 
-    if geoweighted:
+    if intersection_mode is None:
+        intersection_mode = "exact" if geoweighted else "centroid"
+
+    if intersection_mode == "touches":
+        if "geometry_type" not in src.columns:
+            src["geometry_type"] = src.geometry.geom_type.str.replace(
+                "^Multi", "", regex=True
+            )
+        # Full containment (not just centroid-in-polygon): a destination
+        # polygon "touches" (claims) a source row whenever it geometrically
+        # contains it. `predicate="within"` on the *original* src geometry
+        # (no centroid substitution) means a source row can legitimately
+        # match more than one destination row (e.g. it straddles a
+        # destination boundary and is reported as contained by both, or the
+        # destination layer has overlapping polygons).
+        joined = gpd.sjoin(src, dst, predicate="within", how="inner")
+        mapping = joined[[src_id, dst_id]].drop_duplicates()
+        counts = mapping.groupby(src_id)[dst_id].transform("count")
+        mapping = mapping.assign(_geoweight=1.0 / counts)
+        return pl.from_pandas(mapping)
+
+    if intersection_mode == "intersects":
+        # Real geometry-to-geometry intersects test -- no centroid
+        # substitution (unlike "centroid" below) and no area/length overlay
+        # (unlike "exact"). A source row can legitimately match more than
+        # one destination row (it straddles a boundary); each match counts
+        # fully (`_geoweight = 1.0`), matching `"touches"`'s per-row full
+        # weight but without requiring full containment.
+        joined = gpd.sjoin(src, dst, predicate="intersects", how="inner")
+        mapping = joined[[src_id, dst_id]].drop_duplicates()
+        mapping = mapping.assign(_geoweight=1.0)
+        return pl.from_pandas(mapping)
+
+    if intersection_mode == "exact":
         if how is None:
             if "geometry_type" in src.columns:
                 geom_types = src["geometry_type"].drop_duplicates().to_list()
@@ -456,6 +536,35 @@ def h3_cells(
     wkb_arr = cells_to_wkb_polygons(cells)
 
     ids = [c.as_py() for c in cells_to_string(cells)]
+    geoms = [shapely.wkb.loads(w.as_py()) for w in wkb_arr]
+
+    return gpd.GeoDataFrame({"h3": ids}, geometry=geoms, crs="EPSG:4326")
+
+
+def h3_cells_from_ids(cell_ids) -> gpd.GeoDataFrame:
+    """Build polygons for an explicit, already-known list of H3 cell ids.
+
+    Unlike :func:`h3_cells` (which *discovers* the cells covering a
+    geometry via containment), this just vectorizes cells you already have
+    ids for -- the tiled/chunked raster resamplers use it to materialize
+    only one H3-resolution-5 tile's worth of child cells at a time (e.g.
+    via ``h3.cell_to_children``), instead of building geometry for an
+    entire city's fine-resolution grid in one shot.
+
+    Args:
+        cell_ids: Iterable of H3 cell id hex strings.
+
+    Returns:
+        A GeoDataFrame in EPSG:4326 with an ``"h3"`` column and one polygon
+        per cell, same shape/columns as :func:`h3_cells`.
+    """
+    import shapely.wkb
+    from h3ronpy import cells_parse
+    from h3ronpy.vector import cells_to_wkb_polygons
+
+    ids = list(cell_ids)
+    cells = cells_parse(ids)
+    wkb_arr = cells_to_wkb_polygons(cells)
     geoms = [shapely.wkb.loads(w.as_py()) for w in wkb_arr]
 
     return gpd.GeoDataFrame({"h3": ids}, geometry=geoms, crs="EPSG:4326")

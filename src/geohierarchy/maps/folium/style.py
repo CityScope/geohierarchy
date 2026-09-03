@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Dict, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 
 @dataclass
@@ -75,9 +75,13 @@ class ColorSpec:
 
         vmin, vmax = self._resolved_domain(gdf)
         cmap_name = self.cmap if isinstance(self.cmap, str) else "viridis"
-        try:
-            base = bcm.linear.__getattr__(cmap_name.capitalize())
-        except AttributeError:
+        # Try the exact name first (branca's colorbrewer-derived names are mixed-case,
+        # e.g. "RdYlGn_09" -- `.capitalize()` would mangle that to "Rdylgn_09" and never
+        # match, silently falling back to viridis for every non-single-word cmap name).
+        base = getattr(bcm.linear, cmap_name, None)
+        if base is None:
+            base = getattr(bcm.linear, cmap_name.capitalize(), None)
+        if base is None:
             base = bcm.linear.viridis
         colormap = base.scale(vmin, vmax)
         colormap.caption = self.column
@@ -159,6 +163,79 @@ class ColorSpec:
             f"fill: {str(self.fill).lower()}, fillColor: fill, fillOpacity: {self.opacity}}};\n"
             f"}}"
         )
+
+    # ------------------------------------------------------------------
+    def maplibre_fill_color_expr(self, gdf=None) -> Any:
+        """Build a MapLibre GL style expression for this spec's fill color.
+
+        Mirrors :meth:`style_js` (same sampling/lookup logic) but targets
+        MapLibre's declarative expression language instead of a Leaflet.
+        VectorGrid callback, so a Folium-vector-tile level and a MapLibre
+        PMTiles layer sourced from the *same* tiles reach the same visual
+        result -- this is the piece that lets
+        :mod:`geohierarchy.maps.maplibre` reach base-layer parity with
+        :mod:`geohierarchy.maps.folium` without re-deriving color logic.
+
+        Returns:
+            A MapLibre expression (JSON-serializable list), usable directly
+            as a ``"fill-color"``/``"circle-color"``/``"line-color"`` paint
+            value.
+        """
+        if self.kind == "categorical":
+            cats = self._resolved_categories(gdf)
+            expr: List[Any] = ["match", ["to-string", ["get", self.column]]]
+            for cat, color in cats.items():
+                expr.extend([cat, color])
+            expr.append(self.nodata_color)
+            return expr
+
+        vmin, vmax = self._resolved_domain(gdf)
+        colormap = self.branca_colormap(gdf)
+        n_samples = 16
+        stops: List[Any] = []
+        for i in range(n_samples + 1):
+            v = vmin + (vmax - vmin) * i / n_samples
+            stops.extend([v, colormap(v)])
+        return [
+            "case",
+            ["==", ["typeof", ["get", self.column]], "number"],
+            ["interpolate", ["linear"], ["get", self.column], *stops],
+            self.nodata_color,
+        ]
+
+    def maplibre_paint(self, kind: str = "polygon", gdf=None) -> Dict[str, Any]:
+        """Build a full MapLibre ``paint`` dict for this spec.
+
+        Args:
+            kind: One of ``"polygon"``, ``"circle"``, ``"line"`` -- the
+                geometry-rendering primitive, matching
+                :class:`geohierarchy.maps.layers.registry.LayerKind`.
+            gdf: Optional data used to infer domain/categories (see
+                :meth:`maplibre_fill_color_expr`).
+        """
+        color_expr = self.maplibre_fill_color_expr(gdf)
+        stroke = self.color or "#333333"
+        if kind == "circle":
+            return {
+                "circle-color": color_expr,
+                "circle-opacity": self.opacity,
+                "circle-stroke-color": stroke,
+                "circle-stroke-width": self.weight,
+                "circle-radius": 6,
+            }
+        if kind == "line":
+            return {
+                "line-color": color_expr,
+                "line-width": self.weight,
+                "line-opacity": self.opacity,
+            }
+        # polygon (default)
+        paint: Dict[str, Any] = {}
+        if self.fill:
+            paint["fill-color"] = color_expr
+            paint["fill-opacity"] = self.opacity
+        paint["fill-outline-color"] = stroke
+        return paint
 
 
 _DEFAULT_CATEGORICAL_PALETTE = [

@@ -168,9 +168,11 @@ def divide_expr(column_name, group_col, weight_column=None, geoweighted=False):
     else:
         mask = _valid(v)
 
-    w_sum = pl.when(mask).then(w).otherwise(0).sum().over(group_col)
+    w_sum = pl.when(mask).then(eff_w).otherwise(0).sum().over(group_col)
 
-    return pl.when(w_sum > 0).then((v * w) / w_sum).otherwise(None).alias(column_name)
+    return (
+        pl.when(w_sum > 0).then((v * eff_w) / w_sum).otherwise(None).alias(column_name)
+    )
 
 
 # ================================================================
@@ -215,6 +217,7 @@ class AggregationStrategy(ABC):
         geoweighted: bool = False,
         mapping: str = "overlap",
         preserve_total: bool = False,
+        intersection_mode: Optional[str] = None,
     ) -> None:
         """Initialize the strategy.
 
@@ -224,10 +227,26 @@ class AggregationStrategy(ABC):
             mapping: Id-mapping mode, ``"overlap"`` or ``"knn"``.
             preserve_total: Whether this column's downscaled total should
                 exactly match its source total (see class docstring).
+            intersection_mode: How source/destination geometries are paired
+                -- ``"centroid"``, ``"touches"``, or ``"exact"`` (see
+                :func:`geohierarchy.utils.get_id_mapping`). ``None`` (the
+                default) falls back to legacy behavior derived from
+                ``geoweighted`` (``True`` -> ``"exact"``, ``False`` ->
+                ``"centroid"``).
         """
+        # "touches"/"exact" only matter if the resulting `_geoweight` column
+        # is actually consumed by the aggregation math (`sum_agg`/`mean_agg`
+        # etc. only read `_geoweight` when `geoweighted=True`) -- so picking
+        # either mode implies geoweighting unless the caller explicitly
+        # disabled it. "centroid" (the legacy default) leaves `geoweighted`
+        # as given, since every matched row's weight is uniformly 1.0 there
+        # anyway.
+        if intersection_mode in ("touches", "exact"):
+            geoweighted = True
         self.geoweighted = geoweighted
         self.mapping = mapping
         self.preserve_total = preserve_total
+        self.intersection_mode = intersection_mode
 
     @abstractmethod
     def upscale_aggs(self, columns: List[str]) -> List[pl.Expr]:
@@ -375,7 +394,10 @@ class Sum(AggregationStrategy):
     """
 
     def __init__(
-        self, weight_column: Optional[str] = None, geoweighted: bool = False
+        self,
+        weight_column: Optional[str] = None,
+        geoweighted: bool = False,
+        intersection_mode: Optional[str] = None,
     ) -> None:
         """Initialize the strategy.
 
@@ -384,8 +406,12 @@ class Sum(AggregationStrategy):
                 contribution to the sum, on top of any geoweighting.
             geoweighted: Whether to additionally weight rows by geometric
                 overlap fraction.
+            intersection_mode: ``"centroid"``, ``"touches"``, or ``"exact"``
+                -- see :class:`AggregationStrategy`.
         """
-        super().__init__(geoweighted, preserve_total=True)
+        super().__init__(
+            geoweighted, preserve_total=True, intersection_mode=intersection_mode
+        )
         self.weight_column = weight_column
 
     def upscale_aggs(self, columns: List[str]) -> List[pl.Expr]:
@@ -427,7 +453,10 @@ class Mean(AggregationStrategy):
     """
 
     def __init__(
-        self, weight_column: Optional[str] = None, geoweighted: bool = False
+        self,
+        weight_column: Optional[str] = None,
+        geoweighted: bool = False,
+        intersection_mode: Optional[str] = None,
     ) -> None:
         """Initialize the strategy.
 
@@ -436,8 +465,10 @@ class Mean(AggregationStrategy):
                 the average, on top of any geoweighting.
             geoweighted: Whether to additionally weight rows by geometric
                 overlap fraction.
+            intersection_mode: ``"centroid"``, ``"touches"``, or ``"exact"``
+                -- see :class:`AggregationStrategy`.
         """
-        super().__init__(geoweighted)
+        super().__init__(geoweighted, intersection_mode=intersection_mode)
         self.weight_column = weight_column
 
     def upscale_aggs(self, columns: List[str]) -> List[pl.Expr]:

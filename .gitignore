@@ -15,28 +15,37 @@ venv/
 docs/build/
 
 # Python egg files
-*.egg-info
+*.egg-info/
 dist/
 build/
 
-# # Ignore everything in examples/
-# examples/**
+# Test / lint / tool caches (specific dirs only -- do NOT use a generic
+# "*cache*" glob, it also matches legitimate source files such as
+# spatial_cache.py / test_spatial_cache.py)
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
 
-# # BUT include files directly inside examples/ (no subfolders)
-# !examples/*
-# examples/*/
+# Editor backups / scratch files
+*.bak
+*.orig
+*.swp
 
-# # Exclude files that start with "local" (both .py and .ipynb or any extension)
-# examples/local*
-
+# Secrets / credentials (no example/template files ever named this)
 **/api_keys.py
-
-# anything with "cache" in folder or file name
-**/*cache*/
-**/*cache*
-
 **/secrets.txt
+**/.env
+**/.env.*
 
+# Large local test fixtures (regenerate/download locally, not committed)
 **/accessibility_streets.gpkg
 **/block.gpkg
 **/blockgroup.gpkg
+
+# Generated tiles / rendered map output written by examples
+examples/**/tiles/
+examples/**/*.pmtiles
+examples/**/*.mbtiles
+examples/**/*_map.html

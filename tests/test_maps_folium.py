@@ -183,7 +183,10 @@ def test_set_resolution_all_manual_overlap_raises(hierarchy2):
 # ============================================================
 
 
-def test_write_level_tiles_produces_pbf_files(hierarchy2, tmp_path):
+def test_write_level_tiles_produces_pmtiles_file(hierarchy2, tmp_path):
+    # PMTiles (via freestiler) is now the primary output format -- a single
+    # .pmtiles archive per level, replacing the old per-z/x/y .pbf tree.
+    # See fast_tiles.py / tiles.py write_level_tiles(use_xyz=False, default).
     gdf = hierarchy2.get_level("region")
     written = write_level_tiles(
         gdf,
@@ -197,21 +200,13 @@ def test_write_level_tiles_produces_pbf_files(hierarchy2, tmp_path):
     assert len(written) > 0
     for p in written:
         assert p.exists()
-        assert p.suffix == ".pbf"
+        assert p.suffix == ".pmtiles"
         assert p.stat().st_size > 0
-
-    # Directory layout: {tiles_dir}/{level}/{z}/{x}/{y}.pbf
-    for p in written:
-        rel = p.relative_to(tmp_path)
-        parts = rel.parts
-        assert parts[0] == "region"
-        int(parts[1])  # z
-        int(parts[2])  # x
-        int(Path(parts[3]).stem)  # y
 
 
 def test_write_level_tiles_readable_mvt(hierarchy2, tmp_path):
     import mapbox_vector_tile
+    from geohierarchy.maps.folium.pmtiles_to_xyz import extract_xyz_from_pmtiles
 
     gdf = hierarchy2.get_level("region")
     written = write_level_tiles(
@@ -224,15 +219,22 @@ def test_write_level_tiles_readable_mvt(hierarchy2, tmp_path):
         property_cols=["pop"],
     )
     assert written
-    # Tiles must be raw (uncompressed) protobuf bytes: Leaflet.VectorGrid
-    # fetches a tile over plain HTTP and only gunzips it if the response
-    # carries Content-Encoding: gzip, which a plain static host won't add
-    # for a .pbf file -- a gzip-on-disk tile would silently fail to decode
-    # client-side and render nothing.
-    raw = written[0].read_bytes()
+    pmtiles_path = written[0]
+    assert pmtiles_path.suffix == ".pmtiles"
+
+    # Extract one XYZ tile back out of the PMTiles archive and confirm the
+    # bytes are genuinely decodable MVT -- this is what a static host serving
+    # extracted XYZ (or a pmtiles-protocol client unpacking a tile) needs.
+    xyz_dir = extract_xyz_from_pmtiles(
+        pmtiles_path, tmp_path / "xyz", min_zoom=15, max_zoom=16
+    )
+    pbf_files = list(Path(xyz_dir).rglob("*.pbf"))
+    assert pbf_files
+    raw = pbf_files[0].read_bytes()
     decoded = mapbox_vector_tile.decode(raw)
-    assert "region" in decoded
-    assert len(decoded["region"]["features"]) > 0
+    assert len(decoded) > 0
+    first_layer = next(iter(decoded.values()))
+    assert len(first_layer["features"]) > 0
 
 
 # ============================================================
@@ -359,3 +361,78 @@ def test_multi_hierarchy_map_emits_non_overlay_groups(hierarchy2, hierarchy3, tm
     assert '"Fine"' in base_layers_block
     # Both groups' vector layers are present.
     assert html.count("L.vectorGrid.protobuf(") == 3  # region, city, hood
+
+
+# ============================================================
+# MapLibre (PMTiles-native, no XYZ/pbf extraction)
+# ============================================================
+
+
+def test_hierarchy_map_save_maplibre_produces_html(hierarchy2, tmp_path):
+    m = HierarchyMap(
+        hierarchy2,
+        levels=["region", "city"],
+        tiles_dir=str(tmp_path / "tiles"),
+        extract_xyz=False,
+    )
+    m.configure_level(
+        "region", style=ColorSpec(column="pop", cmap="viridis"), popup_fields=["pop"]
+    )
+    m.build()
+    out_path = tmp_path / "map_maplibre.html"
+    m.save_maplibre(str(out_path))
+
+    assert out_path.exists()
+    html = out_path.read_text()
+
+    # PMTiles protocol registered, no L.vectorGrid.protobuf/.pbf XYZ usage.
+    assert "maplibregl" in html
+    assert "pmtiles.Protocol" in html
+    assert "L.vectorGrid.protobuf(" not in html
+    assert "pmtiles://tiles/region.pmtiles" in html
+    assert "pmtiles://tiles/city.pmtiles" in html
+    # Only .pmtiles files were built (no per-tile XYZ .pbf tree).
+    tiles_dir = tmp_path / "tiles"
+    assert any(tiles_dir.glob("*.pmtiles"))
+    assert not list(tiles_dir.rglob("*.pbf"))
+
+
+def test_hierarchy_map_default_still_extracts_xyz_for_folium(hierarchy2, tmp_path):
+    """Regression: `extract_xyz` defaults True so `save()` (Leaflet.VectorGrid,
+    which needs the XYZ .pbf tree) keeps working unmodified for existing
+    callers -- only opt-in `extract_xyz=False` (used by MapLibre-only
+    callers) skips the extraction."""
+    m = HierarchyMap(hierarchy2, levels=["region"], tiles_dir=str(tmp_path / "tiles"))
+    m.build()
+    assert list((tmp_path / "tiles").rglob("*.pbf"))
+
+
+def test_multi_hierarchy_map_save_maplibre_produces_html(
+    hierarchy2, hierarchy3, tmp_path
+):
+    m_a = HierarchyMap(hierarchy2, levels=["region", "city"])
+    m_b = HierarchyMap(hierarchy3, levels=["hood"])
+
+    mm = MultiHierarchyMap(
+        {"Coarse": m_a, "Fine": m_b},
+        default="Coarse",
+        tiles_dir=str(tmp_path / "tiles"),
+    )
+    mm.build()
+    out_path = tmp_path / "multi_maplibre.html"
+    mm.save_maplibre(str(out_path))
+
+    assert out_path.exists()
+    html = out_path.read_text()
+
+    assert "maplibregl" in html
+    assert "pmtiles.Protocol" in html
+    assert "L.vectorGrid.protobuf(" not in html
+    # Both groups' namespaced pmtiles sources are present.
+    assert "Coarse:region" in html
+    assert "Coarse:city" in html
+    assert "Fine:hood" in html
+    # Radio-button switcher for the two named (mutually exclusive) groups.
+    assert 'name="__base_group"' in html
+    assert 'value="Coarse"' in html
+    assert 'value="Fine"' in html
