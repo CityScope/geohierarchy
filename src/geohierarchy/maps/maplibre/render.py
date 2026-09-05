@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from ..layers import get_layer_type
-from ..folium.render import HierarchyMap
+from ..folium.render import HierarchyMap, MAX_NATIVE_TILE_ZOOM
 
 MAPLIBRE_CDN = "https://unpkg.com/maplibre-gl@5.13.0/dist/maplibre-gl.js"
 MAPLIBRE_CSS_CDN = "https://unpkg.com/maplibre-gl@5.13.0/dist/maplibre-gl.css"
@@ -409,6 +409,258 @@ def _default_popup_js(popup_fields: Optional[List[str]]) -> str:
     )
 
 
+def _custom_select_js() -> str:
+    """Replace every native ``<select>`` with a custom dropdown that only
+    closes on an explicit option click or an outside click -- never on the
+    mouse merely leaving the box (explicit user request: "Dropout boxes...
+    do not close them until user clicks on the desired option... if user
+    moved mouse outside the box they close and this is annoying" -- for
+    ALL dropdowns: opacity by, basemap, place, scenario, distribute by,
+    compare with). A plain native ``<select>``'s own open dropdown list is
+    rendered by the OS, not this page, so its close-on-mouse-out behavior
+    can't be overridden from JS at all -- this is why every affected select
+    is instead replaced with a fully custom (page-rendered) equivalent.
+
+    Runs generically over every ``<select>`` in the document, wherever it
+    came from (this module's own layer-switcher, or `transitlos.map.build`'s
+    stats panel, injected separately) -- a `MutationObserver` also catches
+    any `<select>` added to the DOM later, so this doesn't depend on script
+    execution order relative to other injected HTML/JS.
+
+    The original `<select>` is kept in the DOM (hidden, not removed) so
+    every existing `.value`/`.addEventListener('change', ...)` call site
+    elsewhere keeps working unchanged -- `.value = x` assignments are
+    caught automatically (no call site needs to change) by overriding the
+    `value` property's setter on each enhanced element to also refresh the
+    custom widget's displayed label.
+    """
+    return r"""
+<style>
+.__csel-wrap { position: relative; display: inline-block; width: 100%; vertical-align: middle; }
+.__csel-wrap-auto { width: auto; }
+.__csel-btn {
+  width: 100%; box-sizing: border-box; padding: 3px 22px 3px 6px;
+  border: 1px solid #bbb; border-radius: 3px; background: #fff;
+  cursor: pointer; font: inherit; white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis; position: relative;
+}
+.__csel-btn:after {
+  content: ''; position: absolute; right: 7px; top: 50%; width: 0; height: 0;
+  border-left: 4px solid transparent; border-right: 4px solid transparent;
+  border-top: 5px solid #666; transform: translateY(-2px);
+}
+.__csel-list {
+  display: none; position: absolute; top: 100%; left: 0; min-width: 100%;
+  z-index: 10000; background: #fff; border: 1px solid #bbb; border-radius: 3px;
+  max-height: 260px; overflow-y: auto; box-shadow: 0 2px 10px rgba(0,0,0,.18);
+  margin-top: 2px;
+}
+.__csel-list.__csel-open { display: block; }
+.__csel-item { padding: 4px 8px; cursor: pointer; white-space: nowrap; }
+.__csel-item.__csel-sel { background: #eef2ff; font-weight: 600; }
+.__csel-item:hover { background: #e5edff; }
+</style>
+<script>
+(function() {
+  var OPEN_CLASS = '__csel-open';
+  var nativeValueDesc = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value');
+
+  function closeAll(except) {
+    document.querySelectorAll('.__csel-list.' + OPEN_CLASS).forEach(function(l) {
+      if (l !== except) l.classList.remove(OPEN_CLASS);
+    });
+  }
+
+  function enhance(sel) {
+    if (!sel || sel.__cselDone || sel.disabled) return;
+    sel.__cselDone = true;
+
+    // Bug fix (2026-09-04, live user report -- the top-center bar's score
+    // reading squeezed into too little space): `.__csel-wrap`/`.__csel-btn`
+    // used to force `width:100%` on every enhanced select unconditionally.
+    // That's right for a stats-panel select (explicitly `style="width:100%"`
+    // in its own markup, meant to fill its row), but wrong for a compact
+    // inline select like the top-center bar's scenario/place pickers (no
+    // width in their own style -- meant to size to their content) -- 100%
+    // of a `display:flex` row's available space inflated them and left
+    // little room for their flex sibling (the score reading) next to them.
+    // Only fill width when the ORIGINAL select's own inline style actually
+    // asked for it; otherwise size to content, like a native select would.
+    var origStyle = sel.getAttribute('style') || '';
+    var wantsFullWidth = /width\s*:\s*100%/.test(origStyle);
+    var fontMatch = origStyle.match(/font\s*:\s*[^;]+/);
+    var colorMatch = origStyle.match(/(?:^|;)\s*color\s*:\s*[^;]+/);
+
+    var wrap = document.createElement('span');
+    wrap.className = '__csel-wrap' + (wantsFullWidth ? '' : ' __csel-wrap-auto');
+    sel.parentNode.insertBefore(wrap, sel);
+    wrap.appendChild(sel);
+    sel.style.position = 'absolute';
+    sel.style.opacity = '0';
+    sel.style.pointerEvents = 'none';
+    sel.style.width = '1px';
+    sel.style.height = '1px';
+
+    var btn = document.createElement('div');
+    btn.className = '__csel-btn';
+    if (fontMatch) btn.style.font = fontMatch[0].split(':').slice(1).join(':').trim();
+    if (colorMatch) btn.style.color = colorMatch[0].replace(/^;/, '').split(':').slice(1).join(':').trim();
+    if (!wantsFullWidth) {
+      btn.style.width = 'auto';
+      btn.style.paddingRight = '20px';
+      btn.style.border = 'none';
+      btn.style.background = 'transparent';
+    }
+    var list = document.createElement('div');
+    list.className = '__csel-list';
+    wrap.appendChild(btn);
+    wrap.appendChild(list);
+
+    function syncLabel() {
+      var opt = sel.options[sel.selectedIndex];
+      btn.textContent = opt ? opt.textContent : '';
+    }
+
+    function buildList() {
+      list.innerHTML = '';
+      Array.prototype.forEach.call(sel.options, function(opt, i) {
+        var item = document.createElement('div');
+        item.className = '__csel-item' + (i === sel.selectedIndex ? ' __csel-sel' : '');
+        item.textContent = opt.textContent;
+        item.addEventListener('click', function(e) {
+          e.stopPropagation();
+          if (sel.selectedIndex !== i) {
+            nativeValueDesc.set.call(sel, opt.value);
+            syncLabel();
+            sel.dispatchEvent(new Event('change', {bubbles: true}));
+          }
+          list.classList.remove(OPEN_CLASS);
+        });
+        list.appendChild(item);
+      });
+    }
+
+    btn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      var willOpen = !list.classList.contains(OPEN_CLASS);
+      closeAll(null);
+      if (willOpen) {
+        buildList();
+        list.classList.add(OPEN_CLASS);
+      }
+    });
+    list.addEventListener('click', function(e) { e.stopPropagation(); });
+
+    // Catch every `.value = x` assignment anywhere in the page (this
+    // codebase sets stats-tab defaults this way) without touching each
+    // call site -- override the instance's own `value` accessor.
+    Object.defineProperty(sel, 'value', {
+      configurable: true,
+      get: function() { return nativeValueDesc.get.call(sel); },
+      set: function(v) { nativeValueDesc.set.call(sel, v); syncLabel(); },
+    });
+
+    syncLabel();
+  }
+
+  function enhanceAll(root) {
+    (root || document).querySelectorAll('select').forEach(enhance);
+  }
+
+  document.addEventListener('click', function(e) {
+    // Bug fix (2026-09-04, live user report -- "opacity by and basemap
+    // dropdown boxes do not work, I click and nothing opens"): this
+    // listener closes every open dropdown on ANY click outside it, but a
+    // click on the toggle BUTTON itself was still reaching here and
+    // immediately re-closing what that same click had just opened --
+    // `e.stopPropagation()` inside the button's own handler didn't
+    // reliably prevent it in every browser context this page runs in
+    // (confirmed live via headless Chrome + a real DOM click: the class
+    // was added, then removed again, all within the same synchronous
+    // click). Checking the click's real target here, defensively, instead
+    // of relying solely on propagation being stopped upstream.
+    if (e.target && e.target.closest && e.target.closest('.__csel-wrap')) return;
+    closeAll(null);
+  });
+
+  function boot() {
+    enhanceAll(document);
+    new MutationObserver(function(mutations) {
+      mutations.forEach(function(m) {
+        m.addedNodes && m.addedNodes.forEach(function(node) {
+          if (node.nodeType !== 1) return;
+          if (node.tagName === 'SELECT') enhance(node);
+          else if (node.querySelectorAll) enhanceAll(node);
+        });
+      });
+    }).observe(document.body, {childList: true, subtree: true});
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot);
+  } else {
+    boot();
+  }
+})();
+</script>
+"""
+
+
+def _coarsest_level_zoom(hmap, fallback: int = 12) -> int:
+    """The zoom to open a map at so only its coarsest (lowest-resolution)
+    level's tiles load initially, instead of a fixed mid-zoom that can pull
+    in fine-grained census/H3 tiles immediately -- the slow-to-load-a-city
+    complaint this fixes. ``hmap.levels`` is coarse-to-fine (see callers'
+    "coarse -> fine order" convention), so ``levels[0]`` is the coarsest
+    level; its ``set_resolution``-assigned band's upper bound is the last
+    zoom at which ONLY that level (and nothing finer) is visible.
+
+    Superseded as the actual initial-zoom choice by `_finest_level_zoom`
+    below (2026-09-05, explicit user follow-up: the "zoomed out to just the
+    coarsest level" default was reported as "a very low zoom level" that
+    "does not correspond" to what's wanted) -- kept as a still-correct,
+    still-used building block/fallback, not removed.
+    """
+    if not hmap.levels:
+        return fallback
+    band = hmap._manual_resolutions.get(hmap.levels[0])
+    if not band:
+        return fallback
+    # One zoom level below the coarsest level's own upper bound (explicit
+    # follow-up request: "activate the lowest census level on one lower
+    # zoom level") -- a safety margin so the initial view sits solidly
+    # inside the coarsest-only band rather than right on its edge, where a
+    # sub-pixel zoom/rounding difference could pull in the next-finer
+    # level's tiles too.
+    return max(band[1] - 1, band[0])
+
+
+def _finest_level_zoom(hmap, fallback: int = 12) -> int:
+    """The zoom to open a map at so its FINEST (highest-resolution) level
+    is already visible, right at the threshold where zooming back out one
+    more step would switch to the next-coarser level instead.
+
+    2026-09-05, explicit user request: "The map startup zoom level should
+    be the zoom level just before you change from the lowest census level
+    to the next one that is higher. Right now it is a very low zoom level
+    that does not correspond with that" -- "lowest" here means lowest IN
+    THE HIERARCHY (block/blockgroup, the most granular geography, as
+    opposed to `_coarsest_level_zoom`'s "lowest resolution"/coarsest
+    reading), and "the next one that is higher" means the next COARSER
+    level up the hierarchy (blockgroup -> tract, etc.) -- i.e. start
+    zoomed IN, not out. ``hmap.levels`` is coarse-to-fine, so
+    ``levels[-1]`` is the finest level; its band's LOWER bound is the
+    first zoom at which it activates, so opening exactly there shows the
+    finest level immediately without being any more zoomed in than
+    necessary.
+    """
+    if not hmap.levels:
+        return fallback
+    band = hmap._manual_resolutions.get(hmap.levels[-1])
+    if not band:
+        return fallback
+    return band[0]
+
+
 class MapLibreHierarchyMap:
     """Renders an already-built :class:`HierarchyMap` via MapLibre GL JS + PMTiles.
 
@@ -528,6 +780,23 @@ class MapLibreHierarchyMap:
                 ]
 
             min_z, max_z = zoom_ranges[name]
+            # Real bug fix (2026-09-05, live report: "with high zoom levels
+            # circles deactivate"): the comment below (and `HierarchyMap`'s
+            # own tile-build code) has always assumed MapLibre "transparently
+            # overzooms" a vector source past its real tiled max -- true in
+            # general, but MapLibre only does this when the SOURCE's own
+            # `maxzoom` is declared; undeclared, it defaults to MapLibre's
+            # own (much higher) internal default and requests tiles that
+            # were never generated past `MAX_NATIVE_TILE_ZOOM` (18), getting
+            # nothing back -- the layer visually disappears instead of
+            # reusing/scaling the deepest real tile. `native_max_z` (the
+            # same clamp `HierarchyMap.build()` itself applies before
+            # tiling, see that module's `min(max_z, MAX_NATIVE_TILE_ZOOM)`)
+            # is what actually got tiled, captured here BEFORE the
+            # fallback-level widening below changes `max_z` for the STYLE
+            # only (tiles for a fallback level are still only built for its
+            # own narrow band, per `HierarchyMap.fallback_level`'s docstring).
+            native_max_z = min(max_z, MAX_NATIVE_TILE_ZOOM)
             if name == hmap.fallback_level:
                 # Widen the STYLE layer's zoom filter only -- real tiles are
                 # still only generated for this level's own narrow
@@ -570,7 +839,11 @@ class MapLibreHierarchyMap:
                 # *same* feature consistently no matter which tile/zoom
                 # (or, for a chunked level, which chunk source) it's
                 # currently rendered from.
-                source_cfg: Dict[str, Any] = {"type": "vector", "url": pmtiles_url}
+                source_cfg: Dict[str, Any] = {
+                    "type": "vector",
+                    "url": pmtiles_url,
+                    "maxzoom": native_max_z,
+                }
                 if id_col:
                     source_cfg["promoteId"] = {name: id_col}
                 sources[source_id] = source_cfg
@@ -666,6 +939,7 @@ class MapLibreHierarchyMap:
 
         bounds = hmap.hierarchy.level_bounds(hmap.levels[0])
         center = [(bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2]
+        initial_zoom = _finest_level_zoom(hmap)
 
         style_obj = {"version": 8, "sources": sources, "layers": all_layers}
         basemap_before_id_json = (
@@ -818,6 +1092,7 @@ class MapLibreHierarchyMap:
   </style>
 </head>
 <body>
+  {_custom_select_js()}
   <div id="map"></div>
   <script>
     const protocol = new pmtiles.Protocol();
@@ -827,7 +1102,7 @@ class MapLibreHierarchyMap:
       container: 'map',
       style: {json.dumps(style_obj)},
       center: {json.dumps(center)},
-      zoom: 12,
+      zoom: {initial_zoom},
       maxZoom: 24,
     }});
     // Exposed on `window` (2026-09-01, for `code.combined_map`'s zoom-based
@@ -889,6 +1164,8 @@ def save_multi_maplibre(
     opacity_fields: Optional[List[str]] = None,
     default_circle_field: Optional[str] = None,
     field_labels: Optional[Dict[str, str]] = None,
+    radius_field_domains_by_res: Optional[Dict[int, Dict[str, tuple]]] = None,
+    circle_zoom_bands: Optional[Dict[int, tuple]] = None,
 ) -> str:
     """Render a :class:`~geohierarchy.maps.folium.render.MultiHierarchyMap` via MapLibre.
 
@@ -930,6 +1207,24 @@ def save_multi_maplibre(
     entirely) falls back to the raw column name, unchanged from before.
         is currently active -- same "boost/fade on top of, not instead of"
         relationship Folium's own slider has.
+
+    `radius_field_domains_by_res`/`circle_zoom_bands` (2026-09-05, real bug
+    fix -- "circle size legend does not change with zoom"): `radius_field_domains`
+    above is a single FLAT domain, and `__applyCircleRadius` used to apply
+    it to EVERY circle layer id -- every H3 resolution's circles -- with
+    the SAME expression, unconditionally, on page load. This silently
+    overwrote each resolution's own correctly-domain-calibrated static
+    paint (`transitlos.map.build._score_maplibre_paint`, already computed
+    per resolution) with one flat domain sized for whichever resolution's
+    data happened to be passed in, the moment the page loaded -- so circle
+    sizes (and the legend numbers) never actually varied by resolution/zoom
+    in practice, confirmed live on Boston. When given, each circle layer's
+    id is parsed for its H3 resolution (`h3_(\\d+)` in the layer id) and
+    looked up in `radius_field_domains_by_res` for ITS OWN domain instead
+    of the flat one; `circle_zoom_bands` (resolution -> `(minZoom, maxZoom)`)
+    lets the legend TEXT pick the domain matching the map's current zoom.
+    Both optional and additive -- omitting them keeps the old flat-domain
+    behavior for a caller that doesn't pass them.
     """
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -1044,6 +1339,12 @@ def save_multi_maplibre(
     first = next(iter(multi.named_hierarchy_maps.values()))
     bounds = first.hierarchy.level_bounds(first.levels[0])
     center = [(bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2]
+    # The DEFAULT group (not necessarily `first`, which is just whichever
+    # group was added first) decides the initial zoom, since that's the
+    # group actually visible on load -- census when available (coarsest
+    # level = simplest choropleth, fastest to load), else hexagons.
+    default_hmap = multi.named_hierarchy_maps.get(multi.default, first)
+    initial_zoom = _finest_level_zoom(default_hmap)
 
     style_obj = {"version": 8, "sources": all_sources, "layers": all_layers}
     popup_lookup_js = "{\n" + ",\n".join(popup_lookup_entries) + "\n}"
@@ -1173,11 +1474,34 @@ def save_multi_maplibre(
       </label>
     </div>
 """
+    radius_field_domains_by_res = radius_field_domains_by_res or {}
+    circle_zoom_bands = circle_zoom_bands or {}
     style_controls_js = f"""
     const __radiusFieldDomains = {json.dumps({k: list(v) for k, v in radius_field_domains.items()})};
+    const __radiusFieldDomainsByRes = {json.dumps({str(res): {k: list(v) for k, v in d.items()} for res, d in radius_field_domains_by_res.items()})};
+    const __circleZoomBands = {json.dumps({str(res): list(band) for res, band in circle_zoom_bands.items()})};
     const __opacityFieldDomains = {json.dumps({k: list(v) for k, v in opacity_field_domains.items()})};
     const __shapeLayerIdTypes = {json.dumps(shape_layer_id_types)};
     const __circleLayerIds = {json.dumps(circle_layer_ids)};
+    // Resolution each circle layer id belongs to (parsed from the id's
+    // own "h3_<N>" segment, the same convention every level name uses) --
+    // lets per-resolution domains be looked up per layer instead of one
+    // flat domain applied to every resolution at once (see this
+    // function's docstring, "real bug fix" note).
+    function __resFromLayerId(id) {{
+      var m = /h3_(\\d+)/.exec(id);
+      return m ? m[1] : null;
+    }}
+    function __resForZoom(z) {{
+      var best = null;
+      Object.keys(__circleZoomBands).forEach(function(resKey) {{
+        var band = __circleZoomBands[resKey];
+        if (z >= band[0] && z <= band[1]) best = resKey;
+      }});
+      if (best != null) return best;
+      var keys = Object.keys(__circleZoomBands).map(Number);
+      return keys.length ? String(Math.max.apply(null, keys)) : null;
+    }}
     // Exposed on `window` (not just this script's local scope) for
     // test/automation use, matching `window.__mapLevelSources`'s own
     // precedent above.
@@ -1188,8 +1512,12 @@ def save_multi_maplibre(
     window.__shapeOpacity = 1;
     window.__circleField = {json.dumps(default_circle_field)};
 
-    function __circleRadiusExpr(field) {{
-      const d = __radiusFieldDomains[field];
+    function __domainsForLayer(id) {{
+      var res = __resFromLayerId(id);
+      return (res != null && __radiusFieldDomainsByRes[res]) ? __radiusFieldDomainsByRes[res] : __radiusFieldDomains;
+    }}
+    function __circleRadiusExpr(field, domains) {{
+      const d = (domains || __radiusFieldDomains)[field];
       if (!d) return 5;
       const d0 = d[0], d1 = (d[1] > d[0] ? d[1] : d[0] + 1e-9);
       // Item 8 null-guard (same fix as `_circle_radius_expr`/
@@ -1200,7 +1528,9 @@ def save_multi_maplibre(
     }}
     function __applyCircleRadius() {{
       __circleLayerIds.forEach(function(id) {{
-        if (map.getLayer(id)) map.setPaintProperty(id, 'circle-radius', __circleRadiusExpr(window.__circleField));
+        if (map.getLayer(id)) {{
+          map.setPaintProperty(id, 'circle-radius', __circleRadiusExpr(window.__circleField, __domainsForLayer(id)));
+        }}
       }});
     }}
     // Legend sub-sections (`#circleLegend`/`#opacityLegend`/`#devLegend` --
@@ -1229,12 +1559,24 @@ def save_multi_maplibre(
       }}
       return window.__fmtLegendNum ? window.__fmtLegendNum(v) : String(v);
     }}
+    function __activeLegendDomains() {{
+      // Legend text tracks whichever resolution is actually on screen at
+      // the current zoom, not a flat/finest-only domain -- see this
+      // function's docstring's "real bug fix" note.
+      var z = (typeof map !== 'undefined' && map.getZoom) ? map.getZoom() : null;
+      if (z != null && Object.keys(__circleZoomBands).length) {{
+        var res = __resForZoom(z);
+        if (res != null && __radiusFieldDomainsByRes[res]) return __radiusFieldDomainsByRes[res];
+      }}
+      return __radiusFieldDomains;
+    }}
     function __updateCircleLegend() {{
       var el = document.getElementById('circleLegend');
       if (!el) return;
       var activeGroup = document.querySelector('input[name="__base_group"]:checked');
       var field = window.__circleField;
-      var d = field ? __radiusFieldDomains[field] : null;
+      var domains = __activeLegendDomains();
+      var d = field ? domains[field] : null;
       var show = !!(activeGroup && activeGroup.value === 'circles' && field && d);
       el.style.display = show ? 'block' : 'none';
       if (!show) return;
@@ -1252,6 +1594,9 @@ def save_multi_maplibre(
         __updateCircleLegend();
       }});
       __applyCircleRadius();
+    }}
+    if (typeof map !== 'undefined' && map.on && Object.keys(__circleZoomBands).length) {{
+      map.on('zoomend', __updateCircleLegend);
     }}
     __updateCircleLegend();
 
@@ -1593,6 +1938,7 @@ def save_multi_maplibre(
   </style>
 </head>
 <body>
+  {_custom_select_js()}
   <div id="map"></div>
   <div id="layer-switcher">
     <div id="layer-switcher-head">
@@ -1628,7 +1974,7 @@ def save_multi_maplibre(
       container: 'map',
       style: {json.dumps(style_obj)},
       center: {json.dumps(center)},
-      zoom: 12,
+      zoom: {initial_zoom},
       maxZoom: 24,
     }});
     // Exposed on `window` (2026-09-01, for `code.combined_map`'s zoom-based

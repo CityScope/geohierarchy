@@ -843,6 +843,8 @@ class MultiHierarchyMap:
         opacity_fields: Optional[List[str]] = None,
         default_circle_field: Optional[str] = None,
         field_labels: Optional[Dict[str, str]] = None,
+        radius_field_domains_by_res: Optional[Dict[int, Dict[str, tuple]]] = None,
+        circle_zoom_bands: Optional[Dict[int, tuple]] = None,
     ) -> str:
         """Render every group via MapLibre GL JS + PMTiles, toggled by a radio-button switcher.
 
@@ -879,4 +881,6 @@ class MultiHierarchyMap:
             opacity_fields=opacity_fields,
             default_circle_field=default_circle_field,
             field_labels=field_labels,
+            radius_field_domains_by_res=radius_field_domains_by_res,
+            circle_zoom_bands=circle_zoom_bands,
         )

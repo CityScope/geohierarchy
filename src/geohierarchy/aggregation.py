@@ -54,12 +54,27 @@ def sum_agg(column_name, weight_column=None, geoweighted=False):
     else:
         mask = _valid(v)
 
-    sum_w = eff_w.filter(mask).sum()
     n_rows = mask.sum()
 
+    # Bug fix (2026-09-04, live user report + verified: a synthetic 2-cell
+    # example with a cell split 50/50 across two destination polygons
+    # returned totals of 26.67 and 20 for true values of 20 and 10 -- a
+    # ~55%/100% inflation, and NOT a coincidence of that example: this
+    # extra `* (n_rows / sum_w)` factor has no correct interpretation for
+    # an area-weighted SUM. It looks like a stray leftover from a weighted
+    # MEAN's normalization (`mean_agg` correctly divides by `sum_w`, no
+    # `n_rows` involved) accidentally applied here too. The correct
+    # geoweighted/weighted sum is simply `sum(v * eff_w)` -- each row's
+    # value already scaled by its own effective weight (e.g. the real
+    # area-overlap fraction for `geoweighted=True`), nothing more. This was
+    # the actual `Sum(geoweighted=True, intersection_mode="exact")` path
+    # `add_vector_data` uses for every real "area-weighted population"
+    # census-polygon aggregation in this codebase -- verified live,
+    # `sum_agg` (not `sum_expr`, which is unused in production) is exactly
+    # what `Sum.upscale_aggs` -> `GeoHierarchy.add_vector_data` calls.
     return (
-        pl.when(sum_w > 0)
-        .then((v * eff_w * (n_rows / sum_w)).filter(mask).sum())
+        pl.when(n_rows > 0)
+        .then((v * eff_w).filter(mask).sum())
         .otherwise(None)
         .alias(column_name)
     )
@@ -85,12 +100,13 @@ def sum_expr(column_name, group_col, weight_column=None, geoweighted=False):
     else:
         mask = _valid(v)
 
-    sum_w = eff_w.filter(mask).sum().over(group_col)
     n_rows = mask.sum().over(group_col)
 
+    # Same bug fix as `sum_agg` above -- see its comment. `sum_expr` is
+    # unused elsewhere in this codebase currently, but kept consistent.
     return (
-        pl.when(sum_w > 0)
-        .then((v * eff_w * (n_rows / sum_w)).filter(mask).sum().over(group_col))
+        pl.when(n_rows > 0)
+        .then((v * eff_w).filter(mask).sum().over(group_col))
         .otherwise(None)
         .alias(column_name)
     )
