@@ -1265,8 +1265,27 @@ class GeoHierarchy:
                 columns = [c for c in columns if c in agg]
                 exprs = [e for c in columns for e in agg[c].downscale_exprs([c], tid)]
                 result = joined.with_columns(exprs) if exprs else joined
+                consolidate_exprs = [e for c in columns for e in agg[c].consolidate_downscale([c])]
             else:
                 result = agg.downscale(joined, tid, columns)
+                consolidate_exprs = agg.consolidate_downscale(columns)
+            # 2026-09-06 bug fix (live report -- Hamburg's Zensus grid
+            # population replacement silently failing with "Reindexing only
+            # valid with uniquely valued Index objects"): a destination row
+            # in `level` can overlap more than one source row (e.g. an H3
+            # cell straddling two 100m Zensus grid squares), which leaves
+            # one FRAGMENT row per overlap in `result`, still keyed by the
+            # source id (`tid`), not consolidated by destination id at all.
+            # Without this group_by, the final `.join(..., on=self.id_cols[level])`
+            # below duplicates every such destination row once per fragment
+            # -- exactly the caller-facing symptom (a "population" column
+            # whose id index is no longer unique). `consolidate_downscale`
+            # exists specifically for this (e.g. `Sum` sums the fragments
+            # back together, since its downscaled shares are built to sum
+            # back to the source total) but was never actually being
+            # invoked here.
+            if consolidate_exprs:
+                result = result.group_by(self.id_cols[level]).agg(consolidate_exprs)
 
         self.levels[level] = (
             self.levels[level]

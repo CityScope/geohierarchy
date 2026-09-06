@@ -22,6 +22,7 @@ footprints) does not require touching this renderer.
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -634,6 +635,70 @@ def _coarsest_level_zoom(hmap, fallback: int = 12) -> int:
     return max(band[1] - 1, band[0])
 
 
+def _bbox_fit_zoom(
+    bounds: tuple[float, float, float, float],
+    viewport_width: float = 1024,
+    viewport_height: float = 768,
+    max_zoom: int = 18,
+    min_zoom: int = 0,
+    pad_factor: float = 1.0,
+) -> int:
+    """Zoom level at which a lon/lat bounding box just fits a viewport.
+
+    2026-09-06, explicit user request: the map's own startup zoom (and the
+    combined map's zoom-in-to-enter-this-city threshold) should be "a zoom
+    level that allows to cover the complete aoi but is high" -- i.e. as
+    zoomed IN as possible while the whole AOI still fits on screen, not a
+    fixed value tied to whichever census level happens to be finest
+    (`_finest_level_zoom`, which a tiny city like Andorra and a huge one
+    like Boston metro would get the exact same treatment under, even though
+    their AOIs differ by orders of magnitude in extent).
+
+    Same "fit bounds" formula MapLibre/Leaflet/Google Maps use internally
+    (Google's public `getBoundsZoomLevel` algorithm): finds the zoom where
+    the box's fractional width and height of the whole world map both fit
+    within the given pixel viewport, then floors to the last whole zoom
+    where it still fits.
+
+    Args:
+        bounds: ``(minx, miny, maxx, maxy)`` in EPSG:4326 degrees.
+        viewport_width/height: Assumed on-screen map size in pixels --
+            deliberately smaller than a full desktop viewport so the fit
+            holds up on the narrower panel this map is often embedded in
+            (a smaller assumed viewport biases toward a SAFER/lower zoom,
+            never one so tight the AOI's edges clip off-screen).
+        max_zoom: Never return a zoom finer than this real tile ceiling
+            (see `MAX_NATIVE_TILE_ZOOM`).
+        pad_factor: Multiplies the box's extent (about its own center)
+            before fitting -- pass >1 to zoom OUT further than "just
+            fits", e.g. for a companion "covers the AOI and much more
+            area" overview-exit zoom (see that call site's own comment).
+    """
+    minx, miny, maxx, maxy = bounds
+    if pad_factor != 1.0:
+        cx, cy = (minx + maxx) / 2, (miny + maxy) / 2
+        hw, hh = (maxx - minx) / 2 * pad_factor, (maxy - miny) / 2 * pad_factor
+        minx, maxx = cx - hw, cx + hw
+        miny, maxy = max(cy - hh, -85.0), min(cy + hh, 85.0)
+
+    def lat_rad(lat: float) -> float:
+        s = max(min(math.sin(math.radians(lat)), 0.9999), -0.9999)
+        rad_x2 = math.log((1 + s) / (1 - s)) / 2
+        return max(min(rad_x2, math.pi), -math.pi) / 2
+
+    def zoom_for(map_px: float, world_px: float, fraction: float) -> float:
+        if fraction <= 0:
+            return float(max_zoom)
+        return math.log2(map_px / world_px / fraction)
+
+    lat_fraction = (lat_rad(maxy) - lat_rad(miny)) / math.pi
+    lng_fraction = (maxx - minx) / 360 if maxx > minx else 1.0
+
+    lat_zoom = zoom_for(viewport_height, 256, lat_fraction)
+    lng_zoom = zoom_for(viewport_width, 256, lng_fraction)
+    return int(max(min_zoom, min(math.floor(lat_zoom), math.floor(lng_zoom), max_zoom)))
+
+
 def _finest_level_zoom(hmap, fallback: int = 12) -> int:
     """The zoom to open a map at so its FINEST (highest-resolution) level
     is already visible, right at the threshold where zooming back out one
@@ -939,7 +1004,17 @@ class MapLibreHierarchyMap:
 
         bounds = hmap.hierarchy.level_bounds(hmap.levels[0])
         center = [(bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2]
-        initial_zoom = _finest_level_zoom(hmap)
+        # 2026-09-06, explicit user request -- see `_bbox_fit_zoom`'s own
+        # docstring: as zoomed IN as possible while the whole AOI still
+        # fits, not a fixed value tied to whichever census level is finest.
+        initial_zoom = _bbox_fit_zoom(bounds)
+        # Companion "covers the AOI and much more area" zoom (explicit user
+        # request) -- `code.combined_map` reads this (via `__overviewExitZoom`
+        # below) as the threshold for dropping back from this city's own map
+        # to the all-cities overview when the user zooms out; `pad_factor=8`
+        # fits a box 8x this AOI's own extent, i.e. a deliberately much
+        # lower zoom than `initial_zoom`, not just one step lower.
+        overview_exit_zoom = _bbox_fit_zoom(bounds, pad_factor=8.0)
 
         style_obj = {"version": 8, "sources": sources, "layers": all_layers}
         basemap_before_id_json = (
@@ -1112,6 +1187,13 @@ class MapLibreHierarchyMap:
     // `iframe.contentWindow.__mainMap.getZoom()`/`.on('zoomend', ...)` to
     // know when to drop back to its own all-cities overview map.
     window.__mainMap = map;
+    // 2026-09-06, explicit user request -- `code.combined_map` reads this
+    // (regex-parsed straight out of the saved HTML, same as `zoom: N`
+    // above) as the zoom threshold for dropping back to the all-cities
+    // overview when zooming out of this city; see `_bbox_fit_zoom`'s
+    // `pad_factor` comment for why it's deliberately much lower than the
+    // map's own startup zoom, not just one step lower.
+    window.__overviewExitZoom = {overview_exit_zoom};
     map.addControl(new maplibregl.NavigationControl(), 'top-right');
     {basemap_bootstrap_js}
     {interaction_js}
@@ -1344,7 +1426,11 @@ def save_multi_maplibre(
     # group actually visible on load -- census when available (coarsest
     # level = simplest choropleth, fastest to load), else hexagons.
     default_hmap = multi.named_hierarchy_maps.get(multi.default, first)
-    initial_zoom = _finest_level_zoom(default_hmap)
+    default_bounds = default_hmap.hierarchy.level_bounds(default_hmap.levels[0])
+    # 2026-09-06, explicit user request -- see `_bbox_fit_zoom`'s docstring
+    # and the matching comment at the single-group call site above.
+    initial_zoom = _bbox_fit_zoom(default_bounds)
+    overview_exit_zoom = _bbox_fit_zoom(default_bounds, pad_factor=8.0)
 
     style_obj = {"version": 8, "sources": all_sources, "layers": all_layers}
     popup_lookup_js = "{\n" + ",\n".join(popup_lookup_entries) + "\n}"
@@ -1500,7 +1586,17 @@ def save_multi_maplibre(
       }});
       if (best != null) return best;
       var keys = Object.keys(__circleZoomBands).map(Number);
-      return keys.length ? String(Math.max.apply(null, keys)) : null;
+      if (!keys.length) return null;
+      // 2026-09-06 bug fix (see the matching comment in transitlos.map.build's
+      // own __resForZoom -- same bug, same fix, both implementations kept
+      // in lockstep): `z` past every band means either zoomed in past the
+      // finest resolution's band, or zoomed OUT past the coarsest
+      // resolution's lower bound (the common low-zoom case) -- H3
+      // resolution numbers increase with granularity, so the coarsest
+      // resolution is the lowest key, not the highest.
+      var minKey = Math.min.apply(null, keys), maxKey = Math.max.apply(null, keys);
+      var belowAll = z < __circleZoomBands[String(minKey)][0];
+      return String(belowAll ? minKey : maxKey);
     }}
     // Exposed on `window` (not just this script's local scope) for
     // test/automation use, matching `window.__mapLevelSources`'s own
@@ -1553,11 +1649,11 @@ def save_multi_maplibre(
     // formatting) since not every `__fmtLeg` call site has a field name to
     // check. Falls back to plain formatting if `__isPercentField` isn't
     // defined yet (script load order) rather than throwing.
-    function __fmtLeg(v, field) {{
+    function __fmtLeg(v, field, refAbs) {{
       if (field && window.__isPercentField && window.__isPercentField(field)) {{
         return (Number(v) * 100).toFixed(1) + '%';
       }}
-      return window.__fmtLegendNum ? window.__fmtLegendNum(v) : String(v);
+      return window.__fmtLegendNum ? window.__fmtLegendNum(v, refAbs) : String(v);
     }}
     function __activeLegendDomains() {{
       // Legend text tracks whichever resolution is actually on screen at
@@ -1582,9 +1678,10 @@ def save_multi_maplibre(
       if (!show) return;
       var opt = __circleFieldSelect ? __circleFieldSelect.options[__circleFieldSelect.selectedIndex] : null;
       document.getElementById('circleLegendField').textContent = opt ? opt.textContent : field;
-      document.getElementById('circleLegendMin').textContent = __fmtLeg(d[0], field);
-      document.getElementById('circleLegendMid').textContent = __fmtLeg((d[0] + d[1]) / 2, field);
-      document.getElementById('circleLegendMax').textContent = __fmtLeg(d[1], field);
+      var refAbs = Math.max(Math.abs(d[0]), Math.abs(d[1]));
+      document.getElementById('circleLegendMin').textContent = __fmtLeg(d[0], field, refAbs);
+      document.getElementById('circleLegendMid').textContent = __fmtLeg((d[0] + d[1]) / 2, field, refAbs);
+      document.getElementById('circleLegendMax').textContent = __fmtLeg(d[1], field, refAbs);
     }}
     var __circleFieldSelect = document.getElementById('circleFieldSelect');
     if (__circleFieldSelect) {{
@@ -1984,6 +2081,13 @@ def save_multi_maplibre(
     // `iframe.contentWindow.__mainMap.getZoom()`/`.on('zoomend', ...)` to
     // know when to drop back to its own all-cities overview map.
     window.__mainMap = map;
+    // 2026-09-06, explicit user request -- `code.combined_map` reads this
+    // (regex-parsed straight out of the saved HTML, same as `zoom: N`
+    // above) as the zoom threshold for dropping back to the all-cities
+    // overview when zooming out of this city; see `_bbox_fit_zoom`'s
+    // `pad_factor` comment for why it's deliberately much lower than the
+    // map's own startup zoom, not just one step lower.
+    window.__overviewExitZoom = {overview_exit_zoom};
     map.addControl(new maplibregl.NavigationControl(), 'top-right');
     {switcher_js}
     {basemap_controls_js}
