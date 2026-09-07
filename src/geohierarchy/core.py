@@ -1265,7 +1265,9 @@ class GeoHierarchy:
                 columns = [c for c in columns if c in agg]
                 exprs = [e for c in columns for e in agg[c].downscale_exprs([c], tid)]
                 result = joined.with_columns(exprs) if exprs else joined
-                consolidate_exprs = [e for c in columns for e in agg[c].consolidate_downscale([c])]
+                consolidate_exprs = [
+                    e for c in columns for e in agg[c].consolidate_downscale([c])
+                ]
             else:
                 result = agg.downscale(joined, tid, columns)
                 consolidate_exprs = agg.consolidate_downscale(columns)
