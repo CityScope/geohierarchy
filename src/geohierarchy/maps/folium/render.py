@@ -845,6 +845,9 @@ class MultiHierarchyMap:
         field_labels: Optional[Dict[str, str]] = None,
         radius_field_domains_by_res: Optional[Dict[int, Dict[str, tuple]]] = None,
         circle_zoom_bands: Optional[Dict[int, tuple]] = None,
+        special_group_levels: Optional[List[str]] = None,
+        special_group_level_labels: Optional[Dict[str, str]] = None,
+        special_group_name: str = "special",
     ) -> str:
         """Render every group via MapLibre GL JS + PMTiles, toggled by a radio-button switcher.
 
@@ -883,4 +886,7 @@ class MultiHierarchyMap:
             field_labels=field_labels,
             radius_field_domains_by_res=radius_field_domains_by_res,
             circle_zoom_bands=circle_zoom_bands,
+            special_group_levels=special_group_levels,
+            special_group_level_labels=special_group_level_labels,
+            special_group_name=special_group_name,
         )

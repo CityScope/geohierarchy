@@ -861,7 +861,27 @@ class MapLibreHierarchyMap:
             # fallback-level widening below changes `max_z` for the STYLE
             # only (tiles for a fallback level are still only built for its
             # own narrow band, per `HierarchyMap.fallback_level`'s docstring).
-            native_max_z = min(max_z, MAX_NATIVE_TILE_ZOOM)
+            # 2026-09-25 bug fix (live report: "if development checkbox is
+            # active those cells should always be visible regardless of
+            # zoom level" -- reproduced: `development:h3_7_line` genuinely
+            # rendered 0 features at zoom >= 13). This computation ignored
+            # `layer.native_zoom_range` entirely and always assumed every
+            # level was really tiled all the way to `MAX_NATIVE_TILE_ZOOM`
+            # (18) -- true for most levels, but NOT for one explicitly
+            # tiled to a shallower real max (e.g. the development overlay's
+            # `native_zoom_range=(0, 12)`, a deliberate tile-count
+            # optimization -- see that call site's own comment). The
+            # SOURCE's declared `maxzoom` ended up wider (18) than the
+            # PMTiles archive's real content (12), so MapLibre requested
+            # genuinely nonexistent z13+ tiles instead of correctly
+            # overzooming the last real z12 tile it already had -- the
+            # layer silently rendered nothing past that point. Mirrors
+            # Folium's own already-correct handling of this exact field
+            # (`folium/render.py`'s `HierarchyMap.build()`, same pattern).
+            if layer.native_zoom_range is not None:
+                native_max_z = min(layer.native_zoom_range[1], MAX_NATIVE_TILE_ZOOM)
+            else:
+                native_max_z = min(max_z, MAX_NATIVE_TILE_ZOOM)
             if name == hmap.fallback_level:
                 # Widen the STYLE layer's zoom filter only -- real tiles are
                 # still only generated for this level's own narrow
@@ -1116,6 +1136,12 @@ class MapLibreHierarchyMap:
       // on `window.__mapClickPriorityLayers`; checked here, at click time,
       // so it works regardless of which module's JS happens to load/run
       // first.
+      // Bug fix (user report): the route-draw editor's own click handler
+      // (`_route_draw_html_js`) must take priority over this popup while
+      // it's actively adding/moving/deleting a stop or node -- otherwise
+      // clicking a hexagon/census polygon (or an existing stop) to place
+      // an edit also popped this info popup open underneath the editor.
+      if (window.__routeEditorMode && window.__routeEditorMode !== 'idle') return;
       const priorityLayers = (window.__mapClickPriorityLayers || []).filter((id) => map.getLayer(id));
       if (priorityLayers.length && map.queryRenderedFeatures(e.point, {{layers: priorityLayers}}).length) {{
         return;
@@ -1248,6 +1274,9 @@ def save_multi_maplibre(
     field_labels: Optional[Dict[str, str]] = None,
     radius_field_domains_by_res: Optional[Dict[int, Dict[str, tuple]]] = None,
     circle_zoom_bands: Optional[Dict[int, tuple]] = None,
+    special_group_levels: Optional[List[str]] = None,
+    special_group_level_labels: Optional[Dict[str, str]] = None,
+    special_group_name: str = "special",
 ) -> str:
     """Render a :class:`~geohierarchy.maps.folium.render.MultiHierarchyMap` via MapLibre.
 
@@ -1290,6 +1319,26 @@ def save_multi_maplibre(
         is currently active -- same "boost/fade on top of, not instead of"
         relationship Folium's own slider has.
 
+    `special_group_levels` (2026-09-29, explicit user request: place/
+    congressional-district/state-legislative-district/school-district-style
+    levels are PEERS, not a coarse-to-fine zoom-banded hierarchy the way
+    census admin levels are -- the default census dropdown auto-switches
+    levels purely by zoom, but these "special" levels must require an
+    explicit, manual pick instead). When given, names every level (within
+    the named group `special_group_name`, default `"special"`) that should
+    NOT all render simultaneously just because their `HierarchyMap` gives
+    them an always-eligible zoom range -- only `special_group_levels[0]`
+    starts visible, and a new dropdown (shown only while that group is the
+    active shape) lets the user explicitly switch which ONE level's layers
+    are visible, via `map.setLayoutProperty(..., 'visibility', ...)` on
+    that level's own layer ids (`group_level_layer_ids`) -- the exact same
+    mechanism the named-group radio buttons already use one level up,
+    just scoped to layers within one group instead of whole groups.
+    `special_group_level_labels` gives the dropdown's `<option>` text
+    (falls back to the raw level name). Omitting `special_group_levels`
+    (the default) leaves every other named group's behavior byte-for-byte
+    unchanged -- this is purely additive.
+
     `radius_field_domains_by_res`/`circle_zoom_bands` (2026-09-05, real bug
     fix -- "circle size legend does not change with zoom"): `radius_field_domains`
     above is a single FLAT domain, and `__applyCircleRadius` used to apply
@@ -1331,6 +1380,13 @@ def save_multi_maplibre(
     # name, so a chunked level still behaves like one continuous
     # recolorable layer to callers.
     group_level_source_ids: Dict[str, List[str]] = {}
+    # Parallel to `group_level_source_ids`, but LAYER ids (what
+    # `map.setLayoutProperty` needs) rather than source ids -- populated
+    # for every group, but only actually consumed by the manual
+    # per-level toggle below (`special_group_levels`). Kept generic
+    # (not special-cased to one group name) since any named group could
+    # plausibly want this later.
+    group_level_layer_ids: Dict[str, List[str]] = {}
 
     def _add_group(group_name: str, hmap: HierarchyMap, visible: bool) -> None:
         rel_tiles_dir = os.path.relpath(Path(hmap.tiles_dir).resolve(), out_dir)
@@ -1382,6 +1438,9 @@ def save_multi_maplibre(
             gl_layer["layout"] = {"visibility": "visible" if visible else "none"}
             all_layers.append(gl_layer)
             layer_ids.append(gl_layer["id"])
+            group_level_layer_ids.setdefault(f"{group_name}:{level_name}", []).append(
+                gl_layer["id"]
+            )
         group_layer_ids[group_name] = layer_ids
         for level_name, popup_js in popup_js_by_level.items():
             for layer_id in level_layer_ids[level_name]:
@@ -1393,6 +1452,22 @@ def save_multi_maplibre(
         _add_group(group_name, hmap, visible=(group_name == multi.default))
     for group_name, hmap in multi.overlay_hierarchy_maps.items():
         _add_group(group_name, hmap, visible=multi.overlay_show.get(group_name, True))
+
+    # `special_group_levels`: override the whole-group visibility `_add_group`
+    # just set -- every level in this group has an always-eligible zoom
+    # range (see this function's own docstring), so left alone they'd all
+    # render stacked on top of each other the instant the group itself is
+    # visible. Only the first listed level starts visible; the dropdown
+    # built below switches which ONE is, same `setLayoutProperty` mechanism,
+    # scoped one level deeper than the group-level radio buttons.
+    if special_group_levels:
+        for level in special_group_levels[1:]:
+            for layer_id in group_level_layer_ids.get(
+                f"{special_group_name}:{level}", []
+            ):
+                for gl_layer in all_layers:
+                    if gl_layer["id"] == layer_id:
+                        gl_layer["layout"] = {"visibility": "none"}
 
     # Item 3/4 (round 11): every fill/circle layer this call produced (hex,
     # circle, census levels -- never streets/development, which are lines,
@@ -1469,6 +1544,23 @@ def save_multi_maplibre(
     # for every real group, so `el.value === 'none'` alone (true for no
     # real group) hides all of them with no special-case JS needed.
     named_radio_html += '\n<label><input type="radio" name="__base_group" value="none"> □ None</label><br>'
+    # Manual per-level picker for `special_group_levels` -- only meaningful
+    # (and only shown, via the JS below) while `special_group_name` is the
+    # active named group.
+    special_level_select_html = ""
+    if special_group_levels:
+        _special_labels = special_group_level_labels or {}
+        special_options = "\n".join(
+            f'<option value="{lvl}">{_special_labels.get(lvl, lvl)}</option>'
+            for lvl in special_group_levels
+        )
+        special_level_select_html = f"""
+<div id="specialLevelRow" style="display:none;margin-top:4px;">
+  <select id="specialLevelSelect" style="width:100%;">
+    {special_options}
+  </select>
+</div>
+"""
     overlay_checkbox_html = "\n".join(
         f'<label><input type="checkbox" name="__overlay_group" value="{g}"'
         f'{" checked" if multi.overlay_show.get(g, True) else ""}> {_group_icon(g)} {g}</label><br>'
@@ -1612,7 +1704,23 @@ def save_multi_maplibre(
       var res = __resFromLayerId(id);
       return (res != null && __radiusFieldDomainsByRes[res]) ? __radiusFieldDomainsByRes[res] : __radiusFieldDomains;
     }}
-    function __circleRadiusExpr(field, domains) {{
+    // 2026-09-29 bug fix ("circles maps load very very badly or
+    // incompletely but hexagon view not"): this used to cap every
+    // resolution's circle radius at the same flat 18px, same bug as
+    // `_circle_radius_expr`/`_score_maplibre_paint` in
+    // `transitlos.map.build` (see that file's `_CIRCLE_MAX_RADIUS_BY_RES`
+    // comment for the full root-cause explanation) -- and since
+    // `__applyCircleRadius()` below runs unconditionally on every page
+    // load (whenever a "Circle size by" dropdown exists), it was
+    // silently OVERWRITING that Python-side static per-resolution fix
+    // with the same flat 18px the moment the page loaded. Kept in
+    // lockstep with the Python tiers.
+    var __circleMaxRadiusByRes = {{'5': 18, '7': 14, '9': 9, '11': 5}};
+    function __maxRadiusForLayer(id) {{
+      var res = __resFromLayerId(id);
+      return (res != null && __circleMaxRadiusByRes[res] != null) ? __circleMaxRadiusByRes[res] : 18;
+    }}
+    function __circleRadiusExpr(field, domains, maxRadius) {{
       const d = (domains || __radiusFieldDomains)[field];
       if (!d) return 5;
       const d0 = d[0], d1 = (d[1] > d[0] ? d[1] : d[0] + 1e-9);
@@ -1620,12 +1728,12 @@ def save_multi_maplibre(
       // `_score_maplibre_paint` in transitlos.map.build): a feature missing
       // `field` would otherwise throw "Expected value to be of type
       // number, but found null instead."
-      return ['interpolate', ['linear'], ['coalesce', ['get', field], d0], d0, 3, d1, 18];
+      return ['interpolate', ['linear'], ['coalesce', ['get', field], d0], d0, 3, d1, (maxRadius != null ? maxRadius : 18)];
     }}
     function __applyCircleRadius() {{
       __circleLayerIds.forEach(function(id) {{
         if (map.getLayer(id)) {{
-          map.setPaintProperty(id, 'circle-radius', __circleRadiusExpr(window.__circleField, __domainsForLayer(id)));
+          map.setPaintProperty(id, 'circle-radius', __circleRadiusExpr(window.__circleField, __domainsForLayer(id), __maxRadiusForLayer(id)));
         }}
       }});
     }}
@@ -1649,11 +1757,26 @@ def save_multi_maplibre(
     // formatting) since not every `__fmtLeg` call site has a field name to
     // check. Falls back to plain formatting if `__isPercentField` isn't
     // defined yet (script load order) rather than throwing.
+    // 2026-09-26 bug fix (live report: "on map start I see [raw
+    // full-precision floats]... once I move the zoom it works"): this used
+    // to defer to `window.__fmtLegendNum`, defined by a LATER-loading
+    // script (`_inject_maplibre_stats_panel_into_saved_html`) -- correct
+    // once that script has run (any zoom after page load), but the very
+    // FIRST `__updateCircleLegend()` call happens before it, silently
+    // hitting the `: String(v)` fallback and printing the raw unrounded
+    // number. Self-contained now (never depends on load order), and
+    // per explicit user request ("I dont want any decimals") always whole
+    // numbers, with a k/M suffix past 1000/1e6 so a huge coarse-resolution
+    // circle's population doesn't print as a long digit run.
     function __fmtLeg(v, field, refAbs) {{
       if (field && window.__isPercentField && window.__isPercentField(field)) {{
         return (Number(v) * 100).toFixed(1) + '%';
       }}
-      return window.__fmtLegendNum ? window.__fmtLegendNum(v, refAbs) : String(v);
+      if (v == null || isNaN(v)) return '';
+      var abs = Math.abs(v);
+      if (abs >= 1e6) return Math.round(v / 1e6) + 'M';
+      if (abs >= 1e3) return Math.round(v / 1e3) + 'k';
+      return String(Math.round(v));
     }}
     function __activeLegendDomains() {{
       // Legend text tracks whichever resolution is actually on screen at
@@ -1782,10 +1905,36 @@ def save_multi_maplibre(
     switcher_js = f"""
     const namedGroupLayers = {json.dumps({g: ids for g, ids in group_layer_ids.items() if g in multi.named_hierarchy_maps})};
     const overlayGroupLayers = {json.dumps({g: ids for g, ids in group_layer_ids.items() if g in multi.overlay_hierarchy_maps})};
+    // Only populated when `special_group_levels` was passed -- level name
+    // -> that level's own layer ids, within `special_group_name`'s group.
+    // Not sliced from `namedGroupLayers[special_group_name]` at runtime
+    // (that array has every level's ids flattened together) -- see this
+    // function's own docstring for why the whole group can't just be
+    // shown/hidden as one block like every other named group.
+    const specialLevelLayerIds = {json.dumps(
+        {lvl: group_level_layer_ids.get(f"{special_group_name}:{lvl}", []) for lvl in (special_group_levels or [])}
+    )};
+    const specialGroupName = {json.dumps(special_group_name)};
 
     function setGroupVisible(layerIds, visible) {{
       layerIds.forEach(function(id) {{
         map.setLayoutProperty(id, 'visibility', visible ? 'visible' : 'none');
+      }});
+    }}
+
+    // Special group: show ONLY the currently-selected level's own layers,
+    // never the whole group array (which spans every level at once).
+    function __setSpecialGroupVisible(visible) {{
+      var sel = document.getElementById('specialLevelSelect');
+      var level = sel ? sel.value : (Object.keys(specialLevelLayerIds)[0]);
+      Object.keys(specialLevelLayerIds).forEach(function(lvl) {{
+        setGroupVisible(specialLevelLayerIds[lvl], visible && lvl === level);
+      }});
+    }}
+    var __specialLevelRow = document.getElementById('specialLevelRow');
+    if (document.getElementById('specialLevelSelect')) {{
+      document.getElementById('specialLevelSelect').addEventListener('change', function() {{
+        __setSpecialGroupVisible(true);
       }});
     }}
 
@@ -1802,8 +1951,13 @@ def save_multi_maplibre(
     document.querySelectorAll('input[name="__base_group"]').forEach(function(el) {{
       el.addEventListener('change', function() {{
         Object.keys(namedGroupLayers).forEach(function(g) {{
+          if (g === specialGroupName) return;  // handled below, not as one flat block
           setGroupVisible(namedGroupLayers[g], g === el.value);
         }});
+        if (Object.keys(specialLevelLayerIds).length) {{
+          __setSpecialGroupVisible(el.value === specialGroupName);
+        }}
+        if (__specialLevelRow) __specialLevelRow.style.display = (el.value === specialGroupName) ? '' : 'none';
         __updateCircleSizeByVisibility(el.value);
         if (typeof __updateCircleLegend === 'function') __updateCircleLegend();
       }});
@@ -1811,6 +1965,9 @@ def save_multi_maplibre(
     (function() {{
       var __checkedGroup = document.querySelector('input[name="__base_group"]:checked');
       __updateCircleSizeByVisibility(__checkedGroup ? __checkedGroup.value : null);
+      if (__specialLevelRow) {{
+        __specialLevelRow.style.display = (__checkedGroup && __checkedGroup.value === specialGroupName) ? '' : 'none';
+      }}
     }})();
     document.querySelectorAll('input[name="__overlay_group"]').forEach(function(el) {{
       el.addEventListener('change', function() {{
@@ -1959,6 +2116,7 @@ def save_multi_maplibre(
       // on `window.__mapClickPriorityLayers`; checked here, at click time,
       // so it works regardless of which module's JS happens to load/run
       // first.
+      if (window.__routeEditorMode && window.__routeEditorMode !== 'idle') return;
       const priorityLayers = (window.__mapClickPriorityLayers || []).filter((id) => map.getLayer(id));
       if (priorityLayers.length && map.queryRenderedFeatures(e.point, {{layers: priorityLayers}}).length) {{
         return;
@@ -2031,6 +2189,17 @@ def save_multi_maplibre(
     #layer-switcher-body {{ margin-top: 6px; }}
     #layer-switcher-body.collapsed {{ display: none; }}
     #legend-slot:empty {{ display: none; }}
+    /* 2026-09-29, explicit user request: a "/nolegend" URL should start
+       with ONLY the toggle icon visible -- neither the legend nor the
+       layer control -- collapsing both together as one unit, not just the
+       existing layer-control-only toggle. */
+    #layer-switcher.legend-collapsed #legend-slot {{ display: none; }}
+    /* 2026-09-29, explicit user request ("no legend title text Legend
+       beside the legend emoji when legend is closed"): the "Legend"
+       `<strong>` title next to the toggle button is only meaningful once
+       there's a panel open to title -- collapsed, only the emoji icon
+       should remain. */
+    #layer-switcher.legend-collapsed #layer-switcher-head strong {{ display: none; }}
     .maplibregl-popup-content table {{ font-size: 12px; }}
   </style>
 </head>
@@ -2041,8 +2210,10 @@ def save_multi_maplibre(
     <div id="layer-switcher-head">
       <strong>Legend</strong>
       <button id="layer-switcher-toggle" type="button" title="Layers" onclick="(function(){{
+        var wrap = document.getElementById('layer-switcher');
         var b = document.getElementById('layer-switcher-body');
         var collapsed = b.classList.toggle('collapsed');
+        wrap.classList.toggle('legend-collapsed', collapsed);
         document.getElementById('layer-switcher-toggle').textContent = collapsed ? '🗺️ ▾' : '🗺️ ▴';
       }})()">&#x1F5FA;&#xFE0F; &#9652;</button>
     </div>
@@ -2050,6 +2221,7 @@ def save_multi_maplibre(
     <div id="layer-switcher-body">
       <strong>Layers</strong><br>
       {named_radio_html}
+      {special_level_select_html}
       <!-- 2026-09-01 (explicit user request: "the opacity slider for
            hexagons/census/circles to be just below the selector between
            hexagons census circles") -- `style_controls_html` (circle-size-by,
@@ -2062,6 +2234,31 @@ def save_multi_maplibre(
       {basemap_controls_html}
     </div>
   </div>
+  <script>
+    // 2026-09-29, explicit user request: "I want a new option on the
+    // server if I call a city like with nolegend url .../boston/nolegend I
+    // want the legend to be completely collapsed on map start... I want to
+    // start only with the icon and no legend and no layercontrol visible."
+    // `nolegend` isn't a real query param/file extension nginx can route
+    // specially without a server config change -- detected instead as a
+    // path segment (works with the `nolegend/` sibling-directory copy this
+    // page gets deployed under, mirroring the same `combined_map.html`
+    // per-directory-index workaround already in use) or a `?nolegend`
+    // query string (always works, no extra deployed copy needed).
+    (function() {{
+      var path = window.location.pathname || '';
+      var isNoLegend = /(^|[/])nolegend([/]|$)/.test(path) || /[?&]nolegend(=|&|$)/.test(window.location.search || '');
+      if (!isNoLegend) return;
+      var wrap = document.getElementById('layer-switcher');
+      var body = document.getElementById('layer-switcher-body');
+      var toggle = document.getElementById('layer-switcher-toggle');
+      if (wrap && body && toggle) {{
+        body.classList.add('collapsed');
+        wrap.classList.add('legend-collapsed');
+        toggle.textContent = '🗺️ ▾';
+      }}
+    }})();
+  </script>
   {draw_html}
   <script>
     const protocol = new pmtiles.Protocol();
@@ -2103,76 +2300,80 @@ def save_multi_maplibre(
 
 
 def _route_draw_html_js() -> tuple[str, str]:
-    """Minimal click-to-add-point route drawing tool (item 1 of the scenario-editor port).
+    """Multi-line "Draw a new line" editor -- item 4 of the 2026-09-22 redesign.
 
-    Deliberately NOT `maplibre-gl-draw`: that library's MapLibre-compatible
-    fork is not reliably loadable from a CDN alongside this project's pinned
-    `maplibre-gl@5.13.0`, and the UX this needs (draw a fresh line, extend it
-    from either endpoint only, undo last point, clear) is small enough that a
-    ~100-line custom tool avoids an extra third-party dependency entirely --
-    matching the "no new dependency" philosophy `pop_chunks.py` documents for
-    the client-side compute step this feeds (see that module's docstring).
+    2026-09-22, explicit user request (full rewrite of the prior
+    single-route draw tool): replaces the old scenario-list/single-current-
+    route model with a flat list of user-drawn LINES, all belonging to the
+    one implicit "with edits" scenario (`_maplibre_compute_access_js` now
+    owns the original/with-edits scenario simplification; this module owns
+    only the drawing/editing UI and the `lines` data model itself).
 
-    UX, matched to `transitlos/map/build.py`'s `_editor_js` Folium/Geoman tool:
-      - "Draw Route" button arms draw mode; each map click appends a point
-        and the line redraws live; double-click (or the button again) ends
-        the draw.
-      - Once a route exists, clicking within `EXTEND_PX` of its FIRST or LAST
-        node arms "extend" mode from that end; subsequent clicks append there
-        (`unshift` at the start, `push` at the end) -- no mid-route branching,
-        matching Folium's "extend from an endpoint only" rule.
-      - Undo removes the most-recently-added point (from whichever end is
-        active); Clear resets the route to empty.
-      - Drag-to-move: whenever the tool isn't mid-draw/add/delete, mousedown
-        within `EXTEND_PX` of an existing point grabs it; dragging moves it
-        live (map panning is suspended for the gesture); mouseup drops it.
-        Matches Folium/Geoman's "any vertex is always draggable" behavior --
-        round 6 (Item B, sub-part 1) of the port.
-      - "Delete Node" button arms delete mode; clicking a point removes it
-        and the line reconnects around the gap (round 6, sub-part 2).
-      - "Add Node" button arms mid-route insertion; clicking anywhere on the
-        route line projects onto the nearest segment and splices a new point
-        in there, splitting that segment -- ported from Folium's
-        `closestOnRoute`/`insertOnSegment` (round 6, sub-part 3).
+    Data model: `lines = [{id, color, mode, headway, points: [[lng,lat],...],
+    stops: [bool,...]}]` -- `points[i]`/`stops[i]` are parallel arrays,
+    `stops[i] === true` marks that point as a real transit stop, `false`
+    marks it as a shaping-only node on the edge between its neighboring
+    stops (this parallel-array shape already existed in the prior version;
+    what's new here is that there are many such line objects, not one, and
+    the six explicit add/move/delete-stop/node interactions below replace
+    the old free-form "draw/extend from an endpoint" tool).
 
-    Exposes `window.__routeState()` (`{points: [[lng,lat],...]}`) and
-    `window.__setRoutePoints(points)` so `computeAccess()`
-    (`transitlos/map/build.py`'s `_maplibre_compute_access_js`) can
-    read/replace the drawn route and this tool's `window.__setAccessOverride()`
-    counterpart in `render.py`'s live-recolor plumbing can repaint affected
-    features once that recompute lands. Also exposes
-    `window.__dragRoutePoint(idx, lng, lat)` / `window.__deleteRoutePoint(idx)`
-    / `window.__insertRoutePoint(afterIdx, lng, lat)` as direct-call
-    test/automation hooks for the drag/delete/insert gestures, since
-    Playwright can't reliably synthesize real mousedown/mousemove/mouseup
-    sequences against a WebGL canvas -- each hook runs the exact same code
-    the real DOM handlers use. Not ported from Folium: snapping to nearby
-    existing stops (`nearbyStop`/`STOP_SNAP_M`) and per-point station
-    toggling (every point is already treated as a station in this port, see
-    `_maplibre_compute_access_js`'s docstring) -- deferred, matches this
-    port's already-documented scope.
+    UI flow (verbatim user request):
+      1. "Draw a new line" button (`#routeEditToggleBtn`) opens the panel,
+         which defaults to the LINE LIST view (`#routeLineList`): one row
+         per line with its color swatch (native `<input type=color>`,
+         "click on it allow user to change it"), mode `<select>`, headway
+         `<input type=number>`, an edit (pencil) button and a delete (trash)
+         button, plus a "+ Create new line" button at the bottom.
+      2. "+ Create new line" opens a small inline form asking for color/
+         mode/headway, then a "Start adding stops" button enters per-line
+         edit mode for the brand-new (empty) line, defaulting to Add-Stop
+         mode with the hint "click on the map to add stops".
+      3. Per-line edit mode offers six explicit modes as icon buttons:
+         Add Stop, Move Stop, Delete Stop, Add Node, Move Node, Delete Node
+         (see each handler's own comment for its exact click sequence) plus
+         a "Finish edits" button that returns to the line list (the line's
+         current state is already live in `lines` -- there is no separate
+         "save" step, editing IS the with-edits scenario's content).
+
+    Deliberately NOT ported from the prior version: stop-snapping (the
+    former `nearbyStop`/`STOP_SNAP_M`-equivalent never existed in this
+    MapLibre port to begin with -- still true here, per explicit user
+    request "Delete the functionality of when adding a stop adding it to
+    an original stop") and free-form endpoint-extend drawing (replaced
+    entirely by the explicit Add-Stop-appends-at-the-end model, which is
+    simpler and matches "first user clicks on the stops and edges are
+    added straight line").
+
+    Exposes `window.__linesState()` (returns the full `lines` array, deep-
+    copied) for `_maplibre_compute_access_js`'s `computeAccess()` to read,
+    replacing the old single-route `window.__routeState()`/
+    `window.__setRoutePoints()` pair (no longer needed -- there is no
+    longer one "current" route to get/set, just the `lines` array this
+    module owns end-to-end).
     """
     html = """
   <style>
-    /* Item 3 (verbatim user request): the route-editor box should NOT show
-       by default -- only once edit mode is toggled on via the standalone
-       edit-mode icon button (#routeEditToggleBtn, rendered outside this box
-       so it stays clickable while the box itself is hidden). */
-    #route-toolbar { display:none; position:absolute; top:56px; left:10px; z-index:5;
+    /* 2026-09-25, explicit user request: "give the line list of the edits
+       a bit more space" -- was min/max-width 240/280px, forcing every
+       row's color swatch/mode/headway/icon controls to wrap awkwardly.
+       Widened, and `z-index` raised well above every other floating panel
+       on the page (stats panel, legend, etc, all <=1000) so this toolbar
+       -- and anything it opens, like a line row's native <select> dropdown
+       -- always renders on top, per the user's other explicit request
+       ("when a dropdown of that list such as mode is opened z order of it
+       should be before everything else"). */
+    #route-toolbar { display:none; position:absolute; top:56px; left:10px; z-index:10001;
        background:#ffffff; padding:12px 14px; border-radius:10px;
        box-shadow:0 4px 16px rgba(0,0,0,0.18); font:12px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
-       min-width:210px; }
+       min-width:280px; max-width:360px; }
     #route-toolbar.rt-open { display:block; }
-    #routeEditToggleBtn { position:absolute; top:10px; left:10px; z-index:6;
-       font-size:18px; width:34px; height:34px; padding:0; border:1px solid #d8dbe2;
+    #routeEditToggleBtn { position:absolute; top:10px; left:10px; z-index:10002;
+       font-size:12px; font-weight:600; padding:8px 12px; border:1px solid #d8dbe2;
        background:#ffffff; border-radius:8px; cursor:pointer; box-shadow:0 2px 8px rgba(0,0,0,0.18); }
     #routeEditToggleBtn:hover { background:#eef1f5; }
     #routeEditToggleBtn.rt-active { background:#2563eb; border-color:#2563eb; color:#fff; }
-    #route-toolbar .rt-title { font-size:13px; font-weight:600; color:#1a1a2e; display:flex;
-       align-items:center; gap:6px; margin-bottom:8px; }
-    #route-toolbar .rt-badge { font-size:10px; font-weight:600; padding:2px 6px; border-radius:10px;
-       background:#eef0f4; color:#666; }
-    #route-toolbar .rt-badge.unlocked { background:#e3f6e8; color:#1e8a4c; }
+    #route-toolbar .rt-title { font-size:13px; font-weight:600; color:#1a1a2e; margin-bottom:8px; }
     #route-toolbar button { font:inherit; border:1px solid #d8dbe2; background:#fafbfc; color:#333;
        border-radius:6px; padding:6px 9px; margin:0 4px 4px 0; cursor:pointer; transition:background .12s,opacity .12s; }
     #route-toolbar button:hover:not(:disabled) { background:#eef1f5; }
@@ -2181,405 +2382,662 @@ def _route_draw_html_js() -> tuple[str, str]:
     #route-toolbar button.rt-primary { background:#2563eb; border-color:#2563eb; color:#fff; font-weight:600; width:100%; margin:0 0 8px 0; padding:8px 10px; }
     #route-toolbar button.rt-primary:hover { background:#1d4ed8; }
     #route-toolbar .rt-group { border-top:1px solid #eee; margin-top:8px; padding-top:8px; }
-    #routeHint { margin-top:6px; color:#666; max-width:220px; }
-    #routeLockMsg { margin-top:6px; color:#8a5a00; background:#fff6e0; border-radius:6px; padding:6px 8px; }
-    /* Round 17 (item 4): compact +/- (add/delete node) + an edit-mode emoji
-       button, top-left of the toolbar -- the emoji button is the SOLE entry
-       point into the scenario panel (list existing scenarios / create new),
-       replacing the old standalone "+ New Scenario" primary button. */
-    #rt-icon-row { display:flex; gap:4px; margin-bottom:8px; }
-    #rt-icon-row button { font:14px/1 inherit; width:30px; height:30px; padding:0; margin:0;
-       border:1px solid #d8dbe2; background:#fafbfc; border-radius:6px; cursor:pointer; }
-    #rt-icon-row button:hover { background:#eef1f5; }
-    #rt-icon-row button.rt-active { background:#2563eb; border-color:#2563eb; color:#fff; }
-    #rtEditModeBtn { font-size:16px; }
-    /* Scenario panel: list of saved (read-only) scenarios + "create new". */
-    #routeScenarioPanel { display:none; }
-    #routeScenarioList { max-height:160px; overflow-y:auto; margin-bottom:6px; }
-    .rt-scenario-row { display:flex; align-items:center; justify-content:space-between;
-       padding:4px 6px; border:1px solid #eee; border-radius:6px; margin-bottom:4px; font-size:11.5px; }
-    .rt-scenario-row .rt-scenario-name { font-weight:600; color:#1a1a2e; }
-    .rt-scenario-row .rt-scenario-lock { color:#8a5a00; font-size:10px; }
-    .rt-scenario-row button { margin:0; padding:3px 7px; }
-    #routeScenarioEmpty { color:#888; font-style:italic; margin-bottom:6px; }
-    #routeAddStopsRow { display:flex; align-items:center; gap:5px; margin:6px 0; }
-    #routeConfigSection { border-top:1px solid #eee; margin-top:8px; padding-top:8px; }
+    #routeHint { margin-top:6px; color:#666; }
+    /* Line list rows */
+    /* 2026-09-25, explicit user request: "give the line list of line edits
+       more space vertically so that multiple lines fit" -- was 220px. */
+    /* 2026-09-26, explicit user request: reserve the space even with zero
+       lines drawn yet, not just grow once lines exist. */
+    #routeLineList { min-height:420px; max-height:420px; overflow-y:auto; margin-bottom:6px; }
+    .rt-line-row { display:flex; align-items:center; gap:5px; padding:5px 6px; border:1px solid #eee;
+       border-radius:6px; margin-bottom:5px; font-size:11px; flex-wrap:wrap; }
+    .rt-line-row input[type=color] { width:22px; height:22px; padding:0; border:1px solid #ccc;
+       border-radius:4px; cursor:pointer; }
+    .rt-line-row select { font:inherit; font-size:11px; border:1px solid #d8dbe2; border-radius:4px; padding:2px 3px; }
+    .rt-line-row input[type=number] { font:inherit; font-size:11px; width:44px; border:1px solid #d8dbe2;
+       border-radius:4px; padding:2px 3px; }
+    .rt-line-row .rt-icon-btn { width:24px; height:24px; padding:0; margin:0; font-size:12px; }
+    #routeLineListEmpty { color:#888; font-style:italic; margin-bottom:6px; }
+    /* Create-line inline form */
+    #routeCreateForm { display:none; border:1px solid #eee; border-radius:6px; padding:8px; margin-bottom:8px; }
+    #routeCreateForm label { display:block; margin-bottom:5px; }
+    /* Per-line edit mode: 6 explicit action buttons in a 3x2 grid */
+    #rtLineEditModes { display:grid; grid-template-columns:1fr 1fr 1fr; gap:4px; margin-bottom:6px; }
+    #rtLineEditModes button { margin:0; font-size:10.5px; padding:5px 2px; text-align:center; }
   </style>
-  <button id="routeEditToggleBtn" type="button" title="Edit mode: pick or create a scenario">&#9998;&#65039;</button>
+  <button id="routeEditToggleBtn" type="button">Draw a new line</button>
   <div id="route-toolbar">
-    <div class="rt-title">Route editor <span id="routeLockBadge" class="rt-badge">read-only</span></div>
-    <div id="rt-icon-row">
-      <button id="rtAddNodeIconBtn" type="button" title="Add node">&#10133;</button>
-      <button id="rtDeleteNodeIconBtn" type="button" title="Delete node">&#10134;</button>
+    <div class="rt-title">Lines</div>
+
+    <div id="routeLineListView">
+      <div id="routeLineList"></div>
+      <div id="routeLineListEmpty">No lines drawn yet.</div>
+      <button id="routeCreateNewBtn" type="button" class="rt-primary">+ Create new line</button>
     </div>
-    <div id="routeScenarioPanel">
-      <div id="routeScenarioList"></div>
-      <div id="routeScenarioEmpty">No saved scenarios yet.</div>
-      <button id="routeCreateNewBtn" type="button" class="rt-primary">+ Create new route</button>
+
+    <div id="routeCreateForm">
+      <label>Color <input id="rtNewColor" type="color" value="#e6194b"></label>
+      <label>Mode <select id="rtNewMode"></select></label>
+      <label>Headway (min) <input id="rtNewHeadway" type="number" value="10" min="0.5" step="0.5"></label>
+      <button id="rtNewStartBtn" type="button" class="rt-primary">Start adding stops</button>
+      <button id="rtNewCancelBtn" type="button">Cancel</button>
     </div>
-    <div id="routeLockMsg">The default network is read-only. Pick or create a scenario to enable editing.</div>
-    <div id="routeToolButtons" style="display:none;">
-      <button id="routeDrawBtn" type="button">Draw Route</button>
-      <button id="routeAddNodeBtn" type="button">Add Node</button>
-      <button id="routeDeleteNodeBtn" type="button">Delete Node</button>
-      <button id="routeUndoBtn" type="button">Undo</button>
-      <button id="routeClearBtn" type="button">Clear</button>
-      <div id="routeAddStopsRow">
-        <label style="display:flex;align-items:center;gap:4px;cursor:pointer;">
-          <input id="routeAddStopsChk" type="checkbox"> Add stops while drawing
-        </label>
-      </div>
-      <div>
-        <button id="routeAddStopBtn" type="button">Add Stop</button>
-        <button id="routeDeleteStopBtn" type="button">Delete Stop</button>
+
+    <div id="routeLineEditView" style="display:none;">
+      <div id="rtLineEditModes">
+        <button id="rtModeAddStop" type="button" title="Click the map to append a stop">+ Stop</button>
+        <button id="rtModeMoveStop" type="button" title="Click a stop, then click its new position">Move stop</button>
+        <button id="rtModeDeleteStop" type="button" title="Click a stop to delete it">&minus; Stop</button>
+        <button id="rtModeAddNode" type="button" title="Click an edge, then click the node's position">+ Node</button>
+        <button id="rtModeMoveNode" type="button" title="Click a node, then click its new position">Move node</button>
+        <button id="rtModeDeleteNode" type="button" title="Click a node to delete it">&minus; Node</button>
       </div>
       <div id="routeHint"></div>
       <div id="routeConfigSection"></div>
+      <button id="rtFinishEditBtn" type="button" class="rt-primary" style="margin-top:8px;">Finish edits</button>
     </div>
   </div>
 """
     js = r"""
     (function() {
-      var EXTEND_PX = 18; // click-tolerance (px) for grabbing an endpoint to extend from
-      var points = [];      // [[lng,lat], ...] in route order
-      var stations = [];     // parallel bool array: stations[i] true means points[i] is a transit
-                              // stop (round 17, item 5) -- a route node is just line geometry, a
-                              // stop is a distinct entity that may or may not coincide with one.
-      var mode = 'idle';    // 'idle' | 'draw' | 'extend' | 'addnode' | 'delete' | 'addstop' | 'delstop'
-      var extendFrom = null; // 'start' | 'end' | null
-      var dragIdx = -1;      // index of the point currently being drag-moved, or -1
+      var EXTEND_PX = 18; // click-tolerance (px) for hit-testing an existing point/edge
+      var NODE_COLORS = ['#e6194b', '#3cb44b', '#4363d8', '#f58231', '#911eb4', '#46f0f0', '#f032e6', '#bcf60c'];
+      var lines = [];       // [{id, color, mode, headway, points:[[lng,lat],...], stops:[bool,...]}, ...]
+      var nextLineId = 1;
+      var editingLineId = null; // id of the line currently open in the per-line edit view, or null (list view)
+      var mode = 'idle';    // 'idle' | 'addstop' | 'movestop' | 'deletestop' | 'addnode' | 'movenode' | 'deletenode'
+      // Two-step interaction state (add-node / move-node / move-stop all need
+      // a first click to pick a target, then a second click to place it).
+      var pendingEdgeIdx = null;  // add-node: index i means "insert between points[i] and points[i+1]"
+      var pendingMoveIdx = null;  // move-node / move-stop: index of the point being relocated
 
-      // --- edit lock: the default/baseline map is read-only. Editing (draw,
-      // add/delete node, drag, undo/clear) is only allowed once a scenario
-      // has been started (see the "+ New Scenario" button wired in
-      // `_maplibre_compute_access_js`, which calls `window.__setRouteEditLocked(false)`).
-      window.__routeEditLocked = true;
-      window.__setRouteEditLocked = function(locked) {
-        locked = !!locked;
-        var wasLocked = window.__routeEditLocked;
-        window.__routeEditLocked = locked;
-        var toolButtons = document.getElementById('routeToolButtons');
-        var badge = document.getElementById('routeLockBadge');
-        var lockMsg = document.getElementById('routeLockMsg');
-        if (toolButtons) toolButtons.style.display = locked ? 'none' : '';
-        if (lockMsg) lockMsg.style.display = locked ? '' : 'none';
-        if (badge) {
-          badge.textContent = locked ? 'read-only' : 'editing';
-          badge.className = 'rt-badge' + (locked ? '' : ' unlocked');
-        }
-        if (locked && !wasLocked) { setMode('idle'); }
-      };
+      function currentLine() {
+        for (var i = 0; i < lines.length; i++) if (lines[i].id === editingLineId) return lines[i];
+        return null;
+      }
 
       function addRouteLayers() {
-        map.addSource('__route_draw', {
-          type: 'geojson',
-          data: { type: 'FeatureCollection', features: [] },
+        map.addSource('__route_draw', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+        // 2026-09-26, explicit user request: "User drawn lines should have
+        // the same style as original routes but with a thicker border and
+        // more width. And if user selects edits on one line then the
+        // thickness and width should be even higher to highlight it even
+        // more." Mirrors the base routes layer's own cased-line technique
+        // (`_maplibre_stops_routes_js`'s `__routes_casing_*`/`__routes_line_*`
+        // -- a wider plain-black casing drawn first, the route's own
+        // colored line drawn narrower on top), just at bigger base widths,
+        // and wider again specifically for whichever line is currently
+        // being edited (`editing`, stamped by `render()`).
+        map.addLayer({
+          id: '__route_draw_casing', type: 'line', source: '__route_draw',
+          filter: ['==', ['geometry-type'], 'LineString'],
+          layout: { 'line-cap': 'round', 'line-join': 'round' },
+          paint: {
+            'line-color': '#000000',
+            'line-width': ['case', ['==', ['get', 'editing'], true], 12, 8],
+            'line-opacity': 0.85,
+          },
         });
         map.addLayer({
-          id: '__route_draw_line',
-          type: 'line',
-          source: '__route_draw',
-          paint: { 'line-color': '#e6194b', 'line-width': 4, 'line-opacity': 0.9 },
+          id: '__route_draw_line', type: 'line', source: '__route_draw',
+          filter: ['==', ['geometry-type'], 'LineString'],
+          layout: { 'line-cap': 'round', 'line-join': 'round' },
+          paint: {
+            'line-color': ['get', 'color'],
+            'line-width': ['case', ['==', ['get', 'editing'], true], 8, 6],
+            'line-opacity': 0.95,
+          },
         });
+        // Bug fix (user request): a line still being edited (the ONE
+        // matching `editingLineId`) gets heavy edit-mode styling (large,
+        // fully-black non-stop nodes, so shaping handles are easy to grab)
+        // -- every other, already-finished line renders with the exact
+        // same plain style as the rest of the map (small white-fill /
+        // colored-stroke nodes), not the editor's heavy look. `editing` is
+        // stamped onto each feature by `render()` below (declarative
+        // MapLibre paint expressions can't reach into the JS closure for
+        // the live `editingLineId` value directly).
         map.addLayer({
-          id: '__route_draw_points',
-          type: 'circle',
-          source: '__route_draw',
-          filter: ['all', ['==', ['geometry-type'], 'Point'], ['!=', ['get', 'is_station'], true]],
-          paint: { 'circle-color': '#ffffff', 'circle-stroke-color': '#e6194b',
-                    'circle-stroke-width': 2, 'circle-radius': 5 },
+          id: '__route_draw_points', type: 'circle', source: '__route_draw',
+          filter: ['all', ['==', ['geometry-type'], 'Point'], ['!=', ['get', 'is_stop'], true]],
+          paint: {
+            'circle-color': ['case', ['==', ['get', 'editing'], true], '#000000', '#ffffff'],
+            'circle-stroke-color': ['get', 'color'],
+            'circle-stroke-width': 2,
+            'circle-radius': ['case', ['==', ['get', 'editing'], true], 5.5, 4],
+          },
         });
-        // Stations (stops) render as a distinct, larger filled marker so a
-        // "route node" and a "transit stop" are visually different entities
-        // (round 17, item 5).
+        // 2026-09-25, explicit user request: "I want stop icons of edited
+        // lines to be stop emojis once the line is not being edited and
+        // compute has been clicked" -- a plain colored circle for every
+        // OTHER stop (still-editing line, or a finished-but-not-yet-
+        // computed line), a real stop emoji for a line that's both
+        // finished editing AND had Compute run at least once (`computed`,
+        // stamped by `render()` from `line.computed`, itself set by
+        // `window.__markLinesComputed()` -- called from `computeAccess()`'s
+        // success path in `_maplibre_compute_access_js`). The circle layer
+        // excludes exactly those stops so the two layers never overlap.
         map.addLayer({
-          id: '__route_draw_stations',
-          type: 'circle',
-          source: '__route_draw',
-          filter: ['all', ['==', ['geometry-type'], 'Point'], ['==', ['get', 'is_station'], true]],
-          paint: { 'circle-color': '#e6194b', 'circle-stroke-color': '#ffffff',
-                    'circle-stroke-width': 2, 'circle-radius': 7 },
+          id: '__route_draw_stops', type: 'circle', source: '__route_draw',
+          filter: ['all', ['==', ['geometry-type'], 'Point'], ['==', ['get', 'is_stop'], true],
+                   ['!', ['all', ['==', ['get', 'computed'], true], ['==', ['get', 'editing'], false]]]],
+          paint: { 'circle-color': ['get', 'color'], 'circle-stroke-color': '#ffffff',
+                    'circle-stroke-width': 2, 'circle-radius': 6.5 },
+        });
+        // 2026-09-26, explicit user request: "the icons of the stops after
+        // compute should be the same and have the same label stop score
+        // text and same colors and emojis as the normal stops from the
+        // original map" -- supersedes the earlier plain-emoji version.
+        // Reuses the EXACT SAME per-mode SDF icon images
+        // (`__mode_icon_rail`/`__mode_icon_tram`/`__mode_icon_bus`,
+        // registered on this same `map` instance by
+        // `_maplibre_stops_routes_js` in transitlos/map/build.py, which
+        // always runs before a user could possibly click Compute) and the
+        // same 5-stop blue score ramp, rather than a separate flat emoji
+        // glyph -- a finished, computed line's stop now looks pixel-for-
+        // pixel identical to any other stop on the map. BRT has no
+        // dedicated icon (same as the base layer's own `FA_GLYPH` mapping,
+        // which only defines rail/tram/bus) so it shares the bus icon.
+        map.addLayer({
+          id: '__route_draw_stop_icons', type: 'symbol', source: '__route_draw',
+          filter: ['all', ['==', ['geometry-type'], 'Point'], ['==', ['get', 'is_stop'], true],
+                   ['==', ['get', 'computed'], true], ['==', ['get', 'editing'], false]],
+          layout: {
+            'icon-image': ['match', ['get', 'mode_label'],
+              'rail', '__mode_icon_rail', 'tram', '__mode_icon_tram',
+              'brt', '__mode_icon_bus', 'bus', '__mode_icon_bus', '__mode_icon_bus'],
+            'icon-size': 0.48, 'icon-allow-overlap': true, 'icon-ignore-placement': true,
+          },
+          paint: {
+            'icon-color': ['interpolate', ['linear'], ['coalesce', ['get', 'stop_score'], 0],
+              0, '#deebf7', 25, '#9ecae1', 50, '#4292c6', 75, '#2171b5', 100, '#084594'],
+            'icon-halo-color': '#ffffff', 'icon-halo-width': 1,
+          },
+        });
+        // Same small stop-score text label under the icon as the base
+        // stops layer's own `__stops_score_label`.
+        map.addLayer({
+          id: '__route_draw_stop_score_label', type: 'symbol', source: '__route_draw',
+          filter: ['all', ['==', ['geometry-type'], 'Point'], ['==', ['get', 'is_stop'], true],
+                   ['==', ['get', 'computed'], true], ['==', ['get', 'editing'], false]],
+          layout: {
+            'text-field': ['case', ['has', 'stop_score'],
+              ['number-format', ['get', 'stop_score'], { 'min-fraction-digits': 2, 'max-fraction-digits': 2 }], ''],
+            'text-size': 9, 'text-offset': [0, 1.15], 'text-anchor': 'top',
+            'text-allow-overlap': true, 'text-ignore-placement': true,
+          },
+          paint: { 'text-color': '#000000', 'text-halo-color': '#ffffff', 'text-halo-width': 1.4 },
+        });
+        // Zoom-dependent stop-name labels, matching the base GTFS stops
+        // layer's own `__stops_label` (high-zoom-only, `ovStopNamesCheckbox`
+        // toggle -- see `_maplibre_stops_routes_js`/`_inject_maplibre_stops_routes_into_saved_html`
+        // in transitlos/map/build.py) so a finished drawn line's stops
+        // behave identically to every other stop on the map.
+        map.addLayer({
+          id: '__route_draw_stop_labels', type: 'symbol', source: '__route_draw',
+          filter: ['all', ['==', ['geometry-type'], 'Point'], ['==', ['get', 'is_stop'], true]],
+          minzoom: 16,
+          layout: {
+            'text-field': ['get', 'stop_label'],
+            'text-size': 10,
+            'text-offset': [0, 2.1],
+            'text-anchor': 'top',
+            'visibility': (document.getElementById('ovStopNamesCheckbox') &&
+                            document.getElementById('ovStopNamesCheckbox').checked) ? 'visible' : 'none',
+          },
+          paint: { 'text-color': '#1a1a1a', 'text-halo-color': '#ffffff', 'text-halo-width': 1.2 },
+        });
+        var stopNamesCb = document.getElementById('ovStopNamesCheckbox');
+        if (stopNamesCb) {
+          stopNamesCb.addEventListener('change', function(e) {
+            if (map.getLayer('__route_draw_stop_labels')) {
+              map.setLayoutProperty('__route_draw_stop_labels', 'visibility', e.target.checked ? 'visible' : 'none');
+            }
+          });
+        }
+        // Stop-click popup, same look/behavior (maxWidth, closeButton) as
+        // the base map's shape/stop popups -- a finished line's stops must
+        // be clickable just like every other stop, not just draggable
+        // edit-mode handles.
+        var routeStopPopup = new maplibregl.Popup({ closeButton: true, closeOnClick: true, maxWidth: '600px' });
+        function routeStopClickHandler(e) {
+          if (mode !== 'idle') return; // editor's own click handler owns clicks while actively editing
+          var f = e.features && e.features[0];
+          if (!f) return;
+          var p = f.properties;
+          var html = '<div style="font-size:12px;"><b>' + (p.stop_label || 'Stop') + '</b><br>' +
+            'Line mode: ' + (p.mode_label || '(unset)') + '<br>' +
+            'Headway: ' + (p.headway != null ? p.headway + ' min' : '&mdash;') + '</div>';
+          routeStopPopup.setLngLat(e.lngLat).setHTML(html).addTo(map);
+        }
+        // Same popup/cursor behavior on both the circle layer and the
+        // stop-emoji icon layer (`__route_draw_stop_icons`) -- a finished,
+        // computed line's stops are just as clickable as any other.
+        ['__route_draw_stops', '__route_draw_stop_icons'].forEach(function(layerId) {
+          map.on('click', layerId, routeStopClickHandler);
+          map.on('mouseenter', layerId, function() { map.getCanvas().style.cursor = 'pointer'; });
+          map.on('mouseleave', layerId, function() { map.getCanvas().style.cursor = ''; });
         });
       }
-      // `map.addSource`/`addLayer` throw ("Style is not done loading") if
-      // called before the initial style finishes loading (a real race: this
-      // script runs synchronously right after `new maplibregl.Map(...)`,
-      // before any tiles/style JSON have arrived), which would abort this
-      // whole IIFE partway through and leave `window.__routeState` etc.
-      // undefined. Match the rest of this file's `map.isStyleLoaded()` guard
-      // convention instead of assuming synchronous readiness.
       if (map.isStyleLoaded()) { addRouteLayers(); } else { map.on('load', addRouteLayers); }
+      window.__mapClickPriorityLayers = (window.__mapClickPriorityLayers || [])
+        .concat(['__route_draw_stops', '__route_draw_stop_icons', '__route_draw_points']);
+
+      // --- rendering: every line drawn at once, editing line drawn "on top" (layer order is fixed,
+      // but its own color already makes it stand out) ---
+      // Second-click-pending preview (user request: "I want the stop to
+      // stick to the mouse and the edges to move to the mouse so that I can
+      // see the result before the click"). `previewLngLat` tracks the
+      // cursor while a two-step interaction (Add Node's placement click,
+      // Move Node/Move Stop's destination click) is awaiting its second
+      // click; `render()` substitutes it into the CURRENTLY-EDITED line's
+      // points array (never the real committed `line.points`) so the
+      // in-progress edge/point visibly follows the mouse until the click
+      // that actually commits it.
+      var previewLngLat = null;
+      var previewAddStopAt = null;  // addstop mode: index to insert-after, or 'start'/'end' to extend that end
 
       function render() {
         if (!map.getSource('__route_draw')) return;
         var features = [];
-        if (points.length > 1) {
-          features.push({ type: 'Feature', geometry: { type: 'LineString', coordinates: points }, properties: {} });
-        }
-        points.forEach(function(p, i) {
-          features.push({ type: 'Feature', geometry: { type: 'Point', coordinates: p },
-                           properties: { endpoint: (i === 0 || i === points.length - 1),
-                                         is_station: !!stations[i] } });
+        lines.forEach(function(line) {
+          var isEditing = (line.id === editingLineId);
+          var pts = line.points, stopsArr = line.stops;
+          if (isEditing && previewLngLat) {
+            if (mode === 'addnode' && pendingEdgeIdx !== null) {
+              pts = line.points.slice();
+              stopsArr = line.stops.slice();
+              pts.splice(pendingEdgeIdx + 1, 0, previewLngLat);
+              stopsArr.splice(pendingEdgeIdx + 1, 0, false);
+            } else if ((mode === 'movenode' || mode === 'movestop') && pendingMoveIdx !== null) {
+              pts = line.points.slice();
+              pts[pendingMoveIdx] = previewLngLat;
+            } else if (mode === 'addstop' && previewAddStopAt !== null) {
+              pts = line.points.slice();
+              stopsArr = line.stops.slice();
+              if (previewAddStopAt === 'start') { pts.unshift(previewLngLat); stopsArr.unshift(true); }
+              else if (previewAddStopAt === 'end') { pts.push(previewLngLat); stopsArr.push(true); }
+              else { pts.splice(previewAddStopAt + 1, 0, previewLngLat); stopsArr.splice(previewAddStopAt + 1, 0, true); }
+            }
+          }
+          if (pts.length > 1) {
+            features.push({ type: 'Feature', geometry: { type: 'LineString', coordinates: pts },
+                             properties: { color: line.color, lineId: line.id, editing: isEditing } });
+          }
+          var stopN = 0;
+          pts.forEach(function(p, i) {
+            var isStop = !!stopsArr[i];
+            if (isStop) stopN += 1;
+            features.push({ type: 'Feature', geometry: { type: 'Point', coordinates: p },
+                             properties: { color: line.color, lineId: line.id, is_stop: isStop,
+                                           editing: isEditing, computed: !!line.computed,
+                                           mode_label: line.mode, headway: line.headway,
+                                           stop_score: (line.stop_score != null ? line.stop_score : null),
+                                           stop_label: line.id + ' stop ' + stopN } });
+          });
         });
         map.getSource('__route_draw').setData({ type: 'FeatureCollection', features: features });
       }
 
-      function setHint(text) { document.getElementById('routeHint').textContent = text; }
+      // Shared by addstop's live preview (mousemove) AND its actual click
+      // handler, so "where it previews" and "where it lands" can never
+      // drift apart.
+      function addStopTarget(line, point, lngLat) {
+        if (line.points.length === 0) return { at: 'end', lngLat: lngLat };
+        var hit = closestOnLine(point);
+        if (hit.idx >= 0) return { at: hit.idx, lngLat: lngLat };
+        var startPx = map.project(line.points[0]);
+        var endPx = map.project(line.points[line.points.length - 1]);
+        var dStart = Math.hypot(point.x - startPx.x, point.y - startPx.y);
+        var dEnd = Math.hypot(point.x - endPx.x, point.y - endPx.y);
+        return { at: dStart < dEnd ? 'start' : 'end', lngLat: lngLat };
+      }
+
+      map.on('mousemove', function(e) {
+        var line = currentLine();
+        if (!line) return;
+        var lngLat = [e.lngLat.lng, e.lngLat.lat];
+        var pending = (mode === 'addnode' && pendingEdgeIdx !== null) ||
+          ((mode === 'movenode' || mode === 'movestop') && pendingMoveIdx !== null);
+        if (pending) {
+          previewLngLat = lngLat;
+          render();
+        } else if (mode === 'addstop') {
+          var target = addStopTarget(line, e.point, lngLat);
+          previewAddStopAt = target.at;
+          previewLngLat = target.lngLat;
+          render();
+        } else if (previewLngLat) {
+          previewLngLat = null;
+          previewAddStopAt = null;
+          render();
+        }
+      });
+
+      function setHint(text) { var el = document.getElementById('routeHint'); if (el) el.textContent = text; }
 
       function setMode(newMode) {
         mode = newMode;
-        var drawBtn = document.getElementById('routeDrawBtn');
-        var addBtn = document.getElementById('routeAddNodeBtn');
-        var delBtn = document.getElementById('routeDeleteNodeBtn');
-        drawBtn.textContent = (mode === 'draw') ? 'Finish Draw' : 'Draw Route';
-        addBtn.textContent = (mode === 'addnode') ? 'Adding...' : 'Add Node';
-        delBtn.textContent = (mode === 'delete') ? 'Deleting...' : 'Delete Node';
-        var addStopBtn = document.getElementById('routeAddStopBtn');
-        var delStopBtn = document.getElementById('routeDeleteStopBtn');
-        if (addStopBtn) addStopBtn.textContent = (mode === 'addstop') ? 'Click a node...' : 'Add Stop';
-        if (delStopBtn) delStopBtn.textContent = (mode === 'delstop') ? 'Click a stop...' : 'Delete Stop';
-        var addIconBtn = document.getElementById('rtAddNodeIconBtn');
-        var delIconBtn = document.getElementById('rtDeleteNodeIconBtn');
-        if (addIconBtn) addIconBtn.className = (mode === 'addnode') ? 'rt-active' : '';
-        if (delIconBtn) delIconBtn.className = (mode === 'delete') ? 'rt-active' : '';
-        if (mode === 'draw') {
-          setHint('Click the map to add points. Double-click or "Finish Draw" to stop.');
-        } else if (mode === 'addnode') {
-          setHint('Click on the route line to insert a new point there.');
-        } else if (mode === 'delete') {
-          setHint('Click a point to remove it. The route reconnects around it.');
-        } else if (mode === 'addstop') {
-          setHint('Click an existing node to mark it as a stop.');
-        } else if (mode === 'delstop') {
-          setHint('Click a stop to unmark it (the node itself stays).');
-        } else {
-          extendFrom = null;
-          setHint(points.length ? 'Click the first or last point to extend, drag any point to move it.' : '');
-        }
+        // Published so the base map's own click-to-popup handlers (registered
+        // by `interaction_js` in this module, and any duplicate copy for the
+        // group-switcher build) can suppress themselves while the route
+        // editor owns clicks -- otherwise clicking a hexagon/census polygon
+        // or an existing stop while adding/moving/deleting a stop or node
+        // also popped open the base map's info popup underneath the editor.
+        window.__routeEditorMode = mode;
+        pendingEdgeIdx = null;
+        pendingMoveIdx = null;
+        previewLngLat = null;
+        previewAddStopAt = null;
+        ['AddStop', 'MoveStop', 'DeleteStop', 'AddNode', 'MoveNode', 'DeleteNode'].forEach(function(m) {
+          var btn = document.getElementById('rtMode' + m);
+          if (btn) btn.className = (mode === m.toLowerCase()) ? 'rt-active' : '';
+        });
+        var hints = {
+          addstop: 'Click the map to add a stop at the end of the line.',
+          movestop: 'Click a stop, then click its new position.',
+          deletestop: 'Click a stop to delete it (its nodes are removed too; the line reconnects straight through).',
+          addnode: 'Click on the line where the node should go, then click its exact position.',
+          movenode: 'Click a node, then click its new position.',
+          deletenode: 'Click a node to delete it (the line reconnects around it).',
+          idle: '',
+        };
+        setHint(hints[mode] || '');
       }
 
-      document.getElementById('routeDrawBtn').addEventListener('click', function() {
-        if (window.__routeEditLocked) return;
-        setMode(mode === 'draw' ? 'idle' : 'draw');
-      });
-      document.getElementById('routeAddNodeBtn').addEventListener('click', function() {
-        if (window.__routeEditLocked) return;
-        setMode(mode === 'addnode' ? 'idle' : 'addnode');
-      });
-      document.getElementById('routeDeleteNodeBtn').addEventListener('click', function() {
-        if (window.__routeEditLocked) return;
-        setMode(mode === 'delete' ? 'idle' : 'delete');
-      });
-      // Round 17 (item 4): the +/- icons top-left are shortcuts for the same
-      // add-node/delete-node modes as the labeled buttons below (once the
-      // "Create new route" flow reveals the toolbox).
-      document.getElementById('rtAddNodeIconBtn').addEventListener('click', function() {
-        if (window.__routeEditLocked) return;
-        setMode(mode === 'addnode' ? 'idle' : 'addnode');
-      });
-      document.getElementById('rtDeleteNodeIconBtn').addEventListener('click', function() {
-        if (window.__routeEditLocked) return;
-        setMode(mode === 'delete' ? 'idle' : 'delete');
-      });
-      // Round 17 (item 5): distinct add-stop/delete-stop modes -- a stop is a
-      // transit-stop entity flagged on an EXISTING node, not a new geometric
-      // point (that's Add Node's job).
-      document.getElementById('routeAddStopBtn').addEventListener('click', function() {
-        if (window.__routeEditLocked) return;
-        setMode(mode === 'addstop' ? 'idle' : 'addstop');
-      });
-      document.getElementById('routeDeleteStopBtn').addEventListener('click', function() {
-        if (window.__routeEditLocked) return;
-        setMode(mode === 'delstop' ? 'idle' : 'delstop');
-      });
-      document.getElementById('routeUndoBtn').addEventListener('click', function() {
-        if (window.__routeEditLocked || !points.length) return;
-        if (extendFrom === 'start') { points.shift(); stations.shift(); }
-        else { points.pop(); stations.pop(); }
-        render();
-      });
-      document.getElementById('routeClearBtn').addEventListener('click', function() {
-        if (window.__routeEditLocked) return;
-        points = [];
-        stations = [];
-        extendFrom = null;
-        setMode('idle');
-        render();
+      ['AddStop', 'MoveStop', 'DeleteStop', 'AddNode', 'MoveNode', 'DeleteNode'].forEach(function(m) {
+        var btn = document.getElementById('rtMode' + m);
+        if (!btn) return;
+        btn.addEventListener('click', function() {
+          if (!currentLine()) return;
+          setMode(mode === m.toLowerCase() ? 'idle' : m.toLowerCase());
+        });
       });
 
-      map.on('dblclick', function(e) {
-        if (window.__routeEditLocked) return;
-        if (mode === 'draw') { e.preventDefault(); setMode('idle'); }
-      });
-
-      // --- point hit-testing, shared by delete/drag ------------------------
-      function nearestPointIdx(pt, tolerancePx) {
-        var best = -1, bestD = tolerancePx;
-        for (var i = 0; i < points.length; i++) {
-          var px = map.project(points[i]);
+      // --- hit-testing helpers, scoped to the line currently being edited ---
+      function nearestPointIdx(pt, onlyStops) {
+        var line = currentLine();
+        if (!line) return -1;
+        var best = -1, bestD = EXTEND_PX;
+        for (var i = 0; i < line.points.length; i++) {
+          if (onlyStops != null && !!line.stops[i] !== onlyStops) continue;
+          var px = map.project(line.points[i]);
           var d = Math.hypot(pt.x - px.x, pt.y - px.y);
           if (d <= bestD) { bestD = d; best = i; }
         }
         return best;
       }
-
-      // Closest point on the closest segment of the route (for mid-route
-      // insertion, matching Folium's `closestOnRoute`/`insertOnSegment`: the
-      // new point SPLITS the nearest segment rather than being appended).
-      function closestOnRoute(lngLat) {
-        if (points.length < 2) return {idx: -1, lngLat: null};
-        var p = map.project(lngLat);
+      // Closest point on the closest segment (for Add Node's first click) --
+      // returns {idx, lngLat} where idx means "between points[idx] and points[idx+1]".
+      function closestOnLine(pt) {
+        var line = currentLine();
+        if (!line || line.points.length < 2) return { idx: -1, lngLat: null };
         var best = -1, bestD = Infinity, bestLngLat = null;
-        for (var i = 0; i < points.length - 1; i++) {
-          var a = map.project(points[i]), b = map.project(points[i + 1]);
+        for (var i = 0; i < line.points.length - 1; i++) {
+          var a = map.project(line.points[i]), b = map.project(line.points[i + 1]);
           var abx = b.x - a.x, aby = b.y - a.y;
           var len2 = abx * abx + aby * aby;
-          var t = len2 > 0 ? Math.max(0, Math.min(1, ((p.x - a.x) * abx + (p.y - a.y) * aby) / len2)) : 0;
+          var t = len2 > 0 ? Math.max(0, Math.min(1, ((pt.x - a.x) * abx + (pt.y - a.y) * aby) / len2)) : 0;
           var cx = a.x + t * abx, cy = a.y + t * aby;
-          var d = Math.hypot(p.x - cx, p.y - cy);
+          var d = Math.hypot(pt.x - cx, pt.y - cy);
           if (d < bestD) {
             bestD = d; best = i;
             var ll = map.unproject([cx, cy]);
             bestLngLat = [ll.lng, ll.lat];
           }
         }
-        return {idx: best, lngLat: bestLngLat};
+        if (bestD > 40) return { idx: -1, lngLat: null }; // too far from any segment
+        return { idx: best, lngLat: bestLngLat };
       }
 
-      // --- drag-to-move an existing point -----------------------------------
-      // Active whenever the tool isn't mid-draw/add/delete (i.e. 'idle' or
-      // 'extend', which a plain click-near-endpoint can arm) -- matches
-      // Folium/Geoman's "any existing vertex is always draggable" behavior.
-      map.on('mousedown', function(e) {
-        if (window.__routeEditLocked) return;
-        if (mode === 'draw' || mode === 'addnode' || mode === 'delete') return;
-        var idx = nearestPointIdx(e.point, EXTEND_PX);
-        if (idx === -1) return;
-        e.preventDefault();
-        dragIdx = idx;
-        map.dragPan.disable();
-        map.getCanvas().style.cursor = 'grabbing';
-      });
-      map.on('mousemove', function(e) {
-        if (dragIdx === -1) return;
-        points[dragIdx] = [e.lngLat.lng, e.lngLat.lat];
+      // 2026-09-22, explicit user request: "If a stop is deleted then delete
+      // all nodes of the deleted edges and add an edge from the stop before
+      // to the stop after." Both adjoining edges' shaping nodes AND the stop
+      // itself are removed in one splice, leaving the previous and next
+      // stops directly adjacent (a straight edge between them by construction,
+      // same as any other two consecutive points).
+      function deleteStopAt(flatIdx) {
+        var line = currentLine();
+        if (!line) return;
+        var stopIdxs = [];
+        for (var i = 0; i < line.stops.length; i++) if (line.stops[i]) stopIdxs.push(i);
+        var k = stopIdxs.indexOf(flatIdx);
+        if (k === -1) return;
+        var prevStop = k > 0 ? stopIdxs[k - 1] : -1;
+        var nextStop = k < stopIdxs.length - 1 ? stopIdxs[k + 1] : line.points.length;
+        var removeStart = prevStop + 1;
+        var removeCount = nextStop - removeStart;
+        line.points.splice(removeStart, removeCount);
+        line.stops.splice(removeStart, removeCount);
         render();
-      });
-      function endDrag() {
-        if (dragIdx === -1) return;
-        dragIdx = -1;
-        map.dragPan.enable();
-        map.getCanvas().style.cursor = '';
       }
-      map.on('mouseup', endDrag);
-      map.on('mouseout', endDrag);
 
       map.on('click', function(e) {
-        if (window.__routeEditLocked) return;
-        // A drag that just ended fires a trailing 'click' on some browsers;
-        // suppress it so a drag-move never ALSO adds/deletes a point.
-        if (dragIdx !== -1) return;
+        var line = currentLine();
+        if (!line) return;
         var lngLat = [e.lngLat.lng, e.lngLat.lat];
 
-        if (mode === 'draw') {
-          points.push(lngLat);
-          // Live-checked on every click (round 17, item 5): the "Add stops
-          // while drawing" checkbox can be toggled mid-draw, and clicks
-          // after that point must stop/start adding stops immediately --
-          // never just latched at draw-start.
-          var addStopsChk = document.getElementById('routeAddStopsChk');
-          stations.push(!!(addStopsChk && addStopsChk.checked));
+        if (mode === 'addstop') {
+          // Bug fix (user request): adding a stop to a line that already has
+          // points must not always blindly append at the end of the array.
+          // If the click lands near an existing edge (segment), split that
+          // edge and insert the new stop there (mid-line insertion, same
+          // "closest segment" hit-testing `closestOnLine` uses for Add
+          // Node). Otherwise the click is beyond one of the line's two
+          // ends -- extend the line at whichever end (start or end of the
+          // points array) is geometrically nearer to the click.
+          var target = addStopTarget(line, e.point, lngLat);
+          if (target.at === 'start') { line.points.unshift(lngLat); line.stops.unshift(true); }
+          else if (target.at === 'end') { line.points.push(lngLat); line.stops.push(true); }
+          else { line.points.splice(target.at + 1, 0, lngLat); line.stops.splice(target.at + 1, 0, true); }
+          previewAddStopAt = null;
           render();
           return;
         }
 
-        if (mode === 'delete') {
-          var delIdx = nearestPointIdx(e.point, EXTEND_PX);
-          if (delIdx !== -1) { points.splice(delIdx, 1); stations.splice(delIdx, 1); render(); }
+        if (mode === 'deletestop') {
+          var dsIdx = nearestPointIdx(e.point, true);
+          if (dsIdx !== -1) deleteStopAt(dsIdx);
+          return;
+        }
+
+        if (mode === 'deletenode') {
+          var dnIdx = nearestPointIdx(e.point, false);
+          if (dnIdx !== -1) { line.points.splice(dnIdx, 1); line.stops.splice(dnIdx, 1); render(); }
           return;
         }
 
         if (mode === 'addnode') {
-          var hit = closestOnRoute(lngLat);
-          if (hit.idx >= 0 && hit.lngLat) { points.splice(hit.idx + 1, 0, hit.lngLat); stations.splice(hit.idx + 1, 0, false); render(); }
-          return;
-        }
-
-        if (mode === 'addstop') {
-          var asIdx = nearestPointIdx(e.point, EXTEND_PX);
-          if (asIdx !== -1) { stations[asIdx] = true; render(); }
-          return;
-        }
-
-        if (mode === 'delstop') {
-          var dsIdx = nearestPointIdx(e.point, EXTEND_PX);
-          if (dsIdx !== -1) { stations[dsIdx] = false; render(); }
-          return;
-        }
-
-        if (mode === 'extend' && extendFrom) {
-          if (extendFrom === 'start') { points.unshift(lngLat); stations.unshift(false); }
-          else { points.push(lngLat); stations.push(false); }
+          if (pendingEdgeIdx === null) {
+            var hit = closestOnLine(e.point);
+            if (hit.idx >= 0) { pendingEdgeIdx = hit.idx; setHint('Click the node\'s exact position.'); }
+            return;
+          }
+          line.points.splice(pendingEdgeIdx + 1, 0, lngLat);
+          line.stops.splice(pendingEdgeIdx + 1, 0, false);
+          pendingEdgeIdx = null;
+          previewLngLat = null;
+          setHint('Click on the line where the next node should go, then click its exact position.');
           render();
           return;
         }
 
-        // idle: clicking near an endpoint arms extend-from-that-end.
-        if (points.length) {
-          var startPx = map.project(points[0]);
-          var endPx = map.project(points[points.length - 1]);
-          var dStart = Math.hypot(e.point.x - startPx.x, e.point.y - startPx.y);
-          var dEnd = Math.hypot(e.point.x - endPx.x, e.point.y - endPx.y);
-          if (Math.min(dStart, dEnd) <= EXTEND_PX) {
-            extendFrom = dStart <= dEnd ? 'start' : 'end';
-            mode = 'extend';
-            setHint('Extending from the ' + extendFrom + '. Click the map to add points.');
+        if (mode === 'movenode' || mode === 'movestop') {
+          var onlyStops = (mode === 'movestop');
+          if (pendingMoveIdx === null) {
+            var mvIdx = nearestPointIdx(e.point, onlyStops);
+            if (mvIdx !== -1) { pendingMoveIdx = mvIdx; setHint('Click the new position.'); }
+            return;
           }
+          line.points[pendingMoveIdx] = lngLat;
+          pendingMoveIdx = null;
+          previewLngLat = null;
+          setHint(onlyStops ? 'Click a stop, then click its new position.' : 'Click a node, then click its new position.');
+          render();
+          return;
         }
       });
 
-      // Exposed for a future computeAccess() pass (item 2) to read/replace
-      // the drawn route and for tests/verification.
-      // `stations` (round 17, item 5): parallel bool array, `stations[i]`
-      // true iff `points[i]` is also a transit stop, not just line geometry.
-      window.__routeState = function() { return { points: points.slice(), stations: stations.slice(), mode: mode }; };
-      window.__setRoutePoints = function(newPoints, newStations) {
-        points = (newPoints || []).map(function(p) { return [p[0], p[1]]; });
-        stations = (newStations || []).map(function(s) { return !!s; });
-        while (stations.length < points.length) stations.push(false);
-        stations.length = points.length;
+      // --- line list (default) view -----------------------------------------------
+      var MODE_OPTIONS = []; // filled in by _maplibre_compute_access_js once params are known
+      window.__setRouteModeOptions = function(opts) { MODE_OPTIONS = opts || []; refreshCreateFormModes(); };
+      function refreshCreateFormModes() {
+        var sel = document.getElementById('rtNewMode');
+        if (!sel) return;
+        sel.innerHTML = MODE_OPTIONS.map(function(o) { return '<option value="' + o.value + '">' + o.label + '</option>'; }).join('');
+      }
+
+      function refreshLineList() {
+        var listEl = document.getElementById('routeLineList');
+        var emptyEl = document.getElementById('routeLineListEmpty');
+        if (!listEl) return;
+        if (!lines.length) {
+          listEl.innerHTML = '';
+          if (emptyEl) emptyEl.style.display = '';
+        } else {
+          if (emptyEl) emptyEl.style.display = 'none';
+          listEl.innerHTML = lines.map(function(line) {
+            var modeOpts = MODE_OPTIONS.map(function(o) {
+              return '<option value="' + o.value + '"' + (o.value === line.mode ? ' selected' : '') + '>' + o.label + '</option>';
+            }).join('');
+            return '<div class="rt-line-row" data-line="' + line.id + '">' +
+              '<input type="color" data-line-color="' + line.id + '" value="' + line.color + '">' +
+              '<select data-line-mode="' + line.id + '">' + modeOpts + '</select>' +
+              '<input type="number" data-line-headway="' + line.id + '" value="' + line.headway + '" min="0.5" step="0.5" title="Headway (min)">' +
+              '<button type="button" class="rt-icon-btn" data-line-edit="' + line.id + '" title="Edit">&#9998;</button>' +
+              '<button type="button" class="rt-icon-btn" data-line-delete="' + line.id + '" title="Delete">&#128465;</button>' +
+              '</div>';
+          }).join('');
+          Array.prototype.forEach.call(listEl.querySelectorAll('[data-line-color]'), function(el) {
+            el.addEventListener('input', function() {
+              var l = lineById(el.getAttribute('data-line-color')); if (l) { l.color = el.value; render(); }
+            });
+          });
+          Array.prototype.forEach.call(listEl.querySelectorAll('[data-line-mode]'), function(el) {
+            el.addEventListener('change', function() {
+              var l = lineById(el.getAttribute('data-line-mode')); if (l) l.mode = el.value;
+            });
+          });
+          Array.prototype.forEach.call(listEl.querySelectorAll('[data-line-headway]'), function(el) {
+            el.addEventListener('change', function() {
+              var l = lineById(el.getAttribute('data-line-headway')); if (l) l.headway = parseFloat(el.value) || l.headway;
+            });
+          });
+          Array.prototype.forEach.call(listEl.querySelectorAll('[data-line-edit]'), function(el) {
+            el.addEventListener('click', function() { openLineEditor(el.getAttribute('data-line-edit')); });
+          });
+          Array.prototype.forEach.call(listEl.querySelectorAll('[data-line-delete]'), function(el) {
+            el.addEventListener('click', function() {
+              var id = el.getAttribute('data-line-delete');
+              lines = lines.filter(function(l) { return l.id !== id; });
+              render();
+              refreshLineList();
+            });
+          });
+        }
+      }
+      function lineById(id) {
+        for (var i = 0; i < lines.length; i++) if (lines[i].id === id) return lines[i];
+        return null;
+      }
+
+      function showListView() {
+        editingLineId = null;
+        setMode('idle');
+        document.getElementById('routeLineListView').style.display = '';
+        document.getElementById('routeCreateForm').style.display = 'none';
+        document.getElementById('routeLineEditView').style.display = 'none';
+        refreshLineList();
+        // Bug fix: `render()` stamps each feature's `editing` property from
+        // the CURRENT `editingLineId` (see `render()`/`addRouteLayers()`
+        // above) -- without a re-render here, a just-finished line's points
+        // kept `editing: true` (and its heavy edit-mode paint style) until
+        // some unrelated later edit happened to call render() again.
+        render();
+      }
+      function openLineEditor(id) {
+        editingLineId = id;
+        document.getElementById('routeLineListView').style.display = 'none';
+        document.getElementById('routeCreateForm').style.display = 'none';
+        document.getElementById('routeLineEditView').style.display = '';
+        setMode('addstop');
+        render();
+      }
+
+      document.getElementById('routeCreateNewBtn').addEventListener('click', function() {
+        document.getElementById('routeLineListView').style.display = 'none';
+        document.getElementById('routeCreateForm').style.display = 'block';
+        refreshCreateFormModes();
+      });
+      document.getElementById('rtNewCancelBtn').addEventListener('click', showListView);
+      document.getElementById('rtNewStartBtn').addEventListener('click', function() {
+        var color = document.getElementById('rtNewColor').value || NODE_COLORS[lines.length % NODE_COLORS.length];
+        var modeSel = document.getElementById('rtNewMode');
+        var newMode = modeSel && modeSel.value;
+        var headway = parseFloat(document.getElementById('rtNewHeadway').value) || 10;
+        var id = 'line' + (nextLineId++);
+        lines.push({ id: id, color: color, mode: newMode, headway: headway, points: [], stops: [] });
+        document.getElementById('routeCreateForm').style.display = 'none';
+        openLineEditor(id);
+      });
+      document.getElementById('rtFinishEditBtn').addEventListener('click', showListView);
+
+      var editModeBtn = document.getElementById('routeEditToggleBtn');
+      var routeToolbarBox = document.getElementById('route-toolbar');
+      editModeBtn.addEventListener('click', function() {
+        var opening = !routeToolbarBox.classList.contains('rt-open');
+        routeToolbarBox.classList.toggle('rt-open', opening);
+        editModeBtn.className = opening ? 'rt-active' : '';
+        if (opening) {
+          showListView();
+          if (window.__onDrawLineOpened) window.__onDrawLineOpened();
+        }
+      });
+
+      // --- API surface for `_maplibre_compute_access_js` / tests -----------------
+      window.__linesState = function() {
+        return lines.map(function(l) {
+          return { id: l.id, color: l.color, mode: l.mode, headway: l.headway,
+                   points: l.points.map(function(p) { return [p[0], p[1]]; }),
+                   stops: l.stops.slice() };
+        });
+      };
+      // Called by `computeAccess()` (in `_maplibre_compute_access_js`) right
+      // after a successful Compute -- stamps every real `lines` object (not
+      // the `__linesState()` copy) so `render()`'s `computed` property
+      // switches a finished, non-editing line's stops from plain colored
+      // circles to the real stop-emoji icon layer.
+      window.__markLinesComputed = function(scoresByLineId) {
+        lines.forEach(function(l) {
+          l.computed = true;
+          if (scoresByLineId && scoresByLineId[l.id] != null) l.stop_score = scoresByLineId[l.id];
+        });
         render();
       };
-      window.__setRouteStopFlag = function(idx, isStop) {
-        if (idx < 0 || idx >= points.length) return false;
-        stations[idx] = !!isStop;
+      // Test/automation hooks -- Playwright can't reliably synthesize real
+      // mousedown/mousemove/mouseup/dblclick sequences against a WebGL canvas,
+      // so these call the exact same code paths the real click handlers use.
+      window.__createTestLine = function(color, modeName, headway) {
+        var id = 'line' + (nextLineId++);
+        lines.push({ id: id, color: color || '#e6194b', mode: modeName, headway: headway || 10, points: [], stops: [] });
+        editingLineId = id;
         render();
-        return true;
+        return id;
       };
-      // Test/automation hooks for the drag-move and delete-node gestures,
-      // which Playwright can't easily fire as real DOM mouse events against a
-      // WebGL canvas -- these call the exact same code paths the real
-      // mousedown/mousemove/mouseup and delete-mode click handlers use.
-      window.__dragRoutePoint = function(idx, lng, lat) {
-        if (idx < 0 || idx >= points.length) return false;
-        points[idx] = [lng, lat];
-        render();
-        return true;
+      window.__addTestStop = function(lineId, lng, lat) {
+        var l = lineById(lineId); if (!l) return false;
+        l.points.push([lng, lat]); l.stops.push(true); render(); return true;
       };
-      window.__deleteRoutePoint = function(idx) {
-        if (idx < 0 || idx >= points.length) return false;
-        points.splice(idx, 1);
-        stations.splice(idx, 1);
-        render();
-        return true;
+      window.__addTestNode = function(lineId, afterIdx, lng, lat) {
+        var l = lineById(lineId); if (!l) return false;
+        l.points.splice(afterIdx + 1, 0, [lng, lat]); l.stops.splice(afterIdx + 1, 0, false); render(); return true;
       };
-      window.__insertRoutePoint = function(afterIdx, lng, lat) {
-        if (afterIdx < -1 || afterIdx >= points.length) return false;
-        points.splice(afterIdx + 1, 0, [lng, lat]);
-        stations.splice(afterIdx + 1, 0, false);
-        render();
-        return true;
+      window.__deleteTestStop = function(lineId, idx) {
+        var savedEditing = editingLineId; editingLineId = lineId;
+        deleteStopAt(idx); editingLineId = savedEditing; return true;
       };
+      window.__finishTestEdit = function() { showListView(); };
+      render();
     })();
 """
     return html, js
