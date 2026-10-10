@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import gc
 import json
 from dataclasses import dataclass
@@ -71,7 +72,9 @@ if (window.location.protocol === "file:") {
 # quality). Levels whose own zoom range tops out below 18 are unaffected
 # (this is a ceiling, not a floor -- see `min(max_z, MAX_NATIVE_TILE_ZOOM)`
 # below).
-MAX_NATIVE_TILE_ZOOM = 18
+# Overridable (e.g. continent-scale maps set 14: MapLibre overzooms past it) via
+# the GEOHIERARCHY_MAX_NATIVE_TILE_ZOOM environment variable.
+MAX_NATIVE_TILE_ZOOM = int(os.environ.get("GEOHIERARCHY_MAX_NATIVE_TILE_ZOOM", "18"))
 
 
 @dataclass
@@ -194,9 +197,15 @@ class HierarchyMap:
         resolutions: Optional[Dict[str, Any]] = None,
         use_pmtiles: bool = True,
         extract_xyz: bool = True,
+        allow_overlapping_zoom_ranges: bool = False,
     ):
         """
         Args:
+            allow_overlapping_zoom_ranges: If True, manually-specified zoom
+                ranges are used as given, without requiring them to partition
+                ``[0, 25]`` (for sets of alternative levels that are all
+                shown over the full range and toggled by the caller, e.g. a
+                dropdown of unrelated boundary sets).
             hierarchy: A :class:`~geohierarchy.core.GeoHierarchy`.
             levels: Level names to render. Defaults to all of
                 ``hierarchy.geometries``.
@@ -227,6 +236,10 @@ class HierarchyMap:
         self.tiles_dir = tiles_dir
         self.use_pmtiles = use_pmtiles
         self.extract_xyz = extract_xyz
+        self.allow_overlapping_zoom_ranges = allow_overlapping_zoom_ranges
+        # level name -> callable(level_name, id_col, property_cols, min_zoom, max_zoom, tiles_dir) that writes
+        # `<tiles_dir>/<level>/chunk_*.pmtiles` itself (see `build`); such levels are not tiled in-process.
+        self.external_tile_writers: Dict[str, Any] = {}
         self._layers: Dict[str, MapLayer] = {name: MapLayer() for name in self.levels}
         self._manual_resolutions: Dict[str, Any] = {}
         if resolutions:
@@ -308,6 +321,9 @@ class HierarchyMap:
             Mapping of level name to ``(min_zoom, max_zoom)``.
         """
         manual = dict(self._manual_resolutions)
+
+        if self.allow_overlapping_zoom_ranges and set(manual) == set(self.levels):
+            return manual
 
         if not manual:
             result: Dict[str, Any] = assign_resolutions(
@@ -411,6 +427,24 @@ class HierarchyMap:
             # for the full wide table even though only a handful of columns
             # ever reached the tiler. See core.GeoHierarchy.get_level's
             # `columns` parameter.
+            if name in self.external_tile_writers:
+                # Tiles for this level are produced externally (e.g. one state at a time, so a
+                # continent-scale level never has to fit in memory): hand over exactly what the
+                # in-process path would use and move on. The writer must put
+                # `<tiles_dir>/<name>/chunk_*.pmtiles` (MVT layer name == `name`) on disk.
+                min_z, max_z = zoom_ranges[name]
+                if layer.native_zoom_range is not None:
+                    ext_min_z, ext_max_z = layer.native_zoom_range
+                    ext_max_z = min(ext_max_z, MAX_NATIVE_TILE_ZOOM)
+                else:
+                    ext_max_z = min(max_z, MAX_NATIVE_TILE_ZOOM)
+                    ext_min_z = min(min_z, ext_max_z)
+                self.external_tile_writers[name](
+                    level_name=name, id_col=id_col, property_cols=property_cols,
+                    min_zoom=ext_min_z, max_zoom=ext_max_z, tiles_dir=Path(self.tiles_dir),
+                )
+                continue
+
             gdf = self.hierarchy.get_level(name, columns=property_cols)
 
             min_z, max_z = zoom_ranges[name]
@@ -848,6 +882,8 @@ class MultiHierarchyMap:
         special_group_levels: Optional[List[str]] = None,
         special_group_level_labels: Optional[Dict[str, str]] = None,
         special_group_name: str = "special",
+        special_group_fallback_level: Optional[str] = None,
+        special_group_fallback_zoom: int = 5,
     ) -> str:
         """Render every group via MapLibre GL JS + PMTiles, toggled by a radio-button switcher.
 
@@ -889,4 +925,6 @@ class MultiHierarchyMap:
             special_group_levels=special_group_levels,
             special_group_level_labels=special_group_level_labels,
             special_group_name=special_group_name,
+            special_group_fallback_level=special_group_fallback_level,
+            special_group_fallback_zoom=special_group_fallback_zoom,
         )

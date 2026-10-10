@@ -1277,6 +1277,8 @@ def save_multi_maplibre(
     special_group_levels: Optional[List[str]] = None,
     special_group_level_labels: Optional[Dict[str, str]] = None,
     special_group_name: str = "special",
+    special_group_fallback_level: Optional[str] = None,
+    special_group_fallback_zoom: int = 5,
 ) -> str:
     """Render a :class:`~geohierarchy.maps.folium.render.MultiHierarchyMap` via MapLibre.
 
@@ -1338,6 +1340,13 @@ def save_multi_maplibre(
     (falls back to the raw level name). Omitting `special_group_levels`
     (the default) leaves every other named group's behavior byte-for-byte
     unchanged -- this is purely additive.
+
+    `special_group_fallback_level`/`special_group_fallback_zoom`: when set (a
+    level named in `special_group_levels`, e.g. the states layer), picking any
+    OTHER special level shows this fallback level below
+    `special_group_fallback_zoom` and the picked level only from that zoom up
+    (zoom ranges switched at runtime); picking the fallback level itself shows
+    it at every zoom.
 
     `radius_field_domains_by_res`/`circle_zoom_bands` (2026-09-05, real bug
     fix -- "circle size legend does not change with zoom"): `radius_field_domains`
@@ -1924,11 +1933,22 @@ def save_multi_maplibre(
 
     // Special group: show ONLY the currently-selected level's own layers,
     // never the whole group array (which spans every level at once).
+    const specialFallbackLevel = {json.dumps(special_group_fallback_level)};
+    const specialFallbackZoom = {int(special_group_fallback_zoom)};
     function __setSpecialGroupVisible(visible) {{
       var sel = document.getElementById('specialLevelSelect');
       var level = sel ? sel.value : (Object.keys(specialLevelLayerIds)[0]);
+      var useFallback = visible && specialFallbackLevel && specialLevelLayerIds[specialFallbackLevel]
+                        && level !== specialFallbackLevel;
       Object.keys(specialLevelLayerIds).forEach(function(lvl) {{
-        setGroupVisible(specialLevelLayerIds[lvl], visible && lvl === level);
+        var show = visible && lvl === level;
+        var lo = 0, hi = 25;
+        if (useFallback && lvl === specialFallbackLevel) {{ show = true; hi = specialFallbackZoom; }}
+        if (useFallback && lvl === level) {{ lo = specialFallbackZoom; }}
+        setGroupVisible(specialLevelLayerIds[lvl], show);
+        specialLevelLayerIds[lvl].forEach(function(id) {{
+          if (map.getLayer(id)) map.setLayerZoomRange(id, lo, hi);
+        }});
       }});
     }}
     var __specialLevelRow = document.getElementById('specialLevelRow');
