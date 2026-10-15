@@ -1,6 +1,6 @@
 [project]
 name = "geohierarchy"
-version = "0.1.0"
+version = "1.0.0"
 description = "A high-performance hierarchical geospatial data management library using Polars and GeoPandas, inspired by h3-toolkit."
 readme = "README.md"
 requires-python = ">=3.10"
