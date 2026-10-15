@@ -13,6 +13,14 @@ from .aggregation import (
 from .exceptions import ColumnNotFoundError, AggregationStrategyError
 from .utils import h3_cells, get_knn_mapping, get_id_mapping
 from .edges import edges_to_level, edges_to_h3_by_distance
+from .empty_cells import (
+    EMPTY_CELL_METHODS,
+    empty_mask,
+    fill_from_nearest,
+    handle_empty_cells,
+    relocate_weight,
+    weighted_mean,
+)
 from .raster_resample import raster_to_polygons, raster_to_h3
 from .spatial_cache import (
     build_raster_h3_mapping,
@@ -29,6 +37,12 @@ from .spatial_cache import (
 
 __all__ = [
     "GeoHierarchy",
+    "EMPTY_CELL_METHODS",
+    "empty_mask",
+    "fill_from_nearest",
+    "handle_empty_cells",
+    "relocate_weight",
+    "weighted_mean",
     "AggregationStrategy",
     "Sum",
     "Mean",

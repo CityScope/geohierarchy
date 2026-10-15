@@ -136,3 +136,4 @@ tests/test_files/blockgroup.gpkg
 population_data/
 output/
 **/map_tiles/
+**/cache/
