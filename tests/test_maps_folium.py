@@ -260,8 +260,9 @@ def test_hierarchy_map_save_produces_html(hierarchy2, tmp_path):
     assert "leaflet.vectorgrid" in html.lower()
     # One L.vectorGrid.protobuf(...) call per rendered level.
     assert html.count("L.vectorGrid.protobuf(") == 2
-    # Basemap tile URL present (default cartodb_positron).
-    assert "basemaps.cartocdn.com" in html
+    # Basemap: MapLibre vector style (default openfreemap_positron), no CartoDB.
+    assert "tiles.openfreemap.org/styles/positron" in html and "L.maplibreGL" in html
+    assert "cartocdn" not in html
     # Tile URL template for at least one level.
     assert "tiles/region/" in html or "tiles\\/region\\/" in html
 
@@ -313,8 +314,12 @@ def test_basemap_not_registered_in_layer_control(hierarchy2, tmp_path):
     """
     from geohierarchy.maps.folium.basemap import build_tile_layer
 
-    layer = build_tile_layer("cartodb_positron")
-    assert layer.control is False
+    from geohierarchy.maps.folium.maplibre_basemap import MapLibreBasemap
+
+    # The MapLibre background is not a Leaflet layer-control entry at all ...
+    assert isinstance(build_tile_layer("openfreemap_positron"), MapLibreBasemap)
+    # ... and raster presets stay out of the control group.
+    assert build_tile_layer("osm").control is False
 
 
 def test_hierarchy_map_build_is_idempotent(hierarchy2, tmp_path):

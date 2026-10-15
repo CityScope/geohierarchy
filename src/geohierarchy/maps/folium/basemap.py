@@ -1,4 +1,4 @@
-"""Basemap presets and helpers for building the underlying raster tile layer."""
+"""Basemap presets and helpers for building the map background (MapLibre vector style or raster XYZ)."""
 
 from __future__ import annotations
 
@@ -6,26 +6,33 @@ from typing import Any, Dict, Union
 
 MAP_MAX_ZOOM = 25
 
+_OFM_ATTR = (
+    '&copy; <a href="https://openfreemap.org">OpenFreeMap</a> '
+    '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+)
+
 BASEMAPS: Dict[str, Dict[str, Any]] = {
-    "cartodb_positron": {
-        "tiles": "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
-        "attr": (
-            '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> '
-            'contributors &copy; <a href="https://carto.com/attributions">CARTO</a>'
-        ),
-        "name": "CartoDB Positron",
-        "max_native_zoom": 20,
-        "subdomains": "abcd",
+    # MapLibre vector-tile styles (OpenFreeMap, no API key). Drawn through
+    # ``maplibre-gl-leaflet``; see ``maplibre_basemap.MapLibreBasemap``.
+    "openfreemap_positron": {
+        "style": "https://tiles.openfreemap.org/styles/positron",
+        "attr": _OFM_ATTR,
+        "name": "OpenFreeMap Positron",
     },
-    "cartodb_dark_matter": {
-        "tiles": "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
-        "attr": (
-            '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> '
-            'contributors &copy; <a href="https://carto.com/attributions">CARTO</a>'
-        ),
-        "name": "CartoDB Dark Matter",
-        "max_native_zoom": 20,
-        "subdomains": "abcd",
+    "openfreemap_bright": {
+        "style": "https://tiles.openfreemap.org/styles/bright",
+        "attr": _OFM_ATTR,
+        "name": "OpenFreeMap Bright",
+    },
+    "openfreemap_liberty": {
+        "style": "https://tiles.openfreemap.org/styles/liberty",
+        "attr": _OFM_ATTR,
+        "name": "OpenFreeMap Liberty",
+    },
+    "openfreemap_dark": {
+        "style": "https://tiles.openfreemap.org/styles/dark",
+        "attr": _OFM_ATTR,
+        "name": "OpenFreeMap Dark",
     },
     "osm": {
         "tiles": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
@@ -77,7 +84,11 @@ BASEMAPS: Dict[str, Dict[str, Any]] = {
 
 
 def build_tile_layer(basemap: Union[str, dict, Any]):
-    """Build a ``folium.TileLayer`` from a preset name, dict, or passthrough instance.
+    """Build the background layer from a preset name, dict, or passthrough instance.
+
+    Presets starting with ``openfreemap_`` (or a dict with a ``style`` URL) give a
+    MapLibre vector-tile background (a :class:`MapLibreBasemap`); the rest are raster
+    ``folium.TileLayer``s.
 
     Args:
         basemap: One of: a preset name (key of :data:`BASEMAPS`), a
@@ -111,6 +122,11 @@ def build_tile_layer(basemap: Union[str, dict, Any]):
         raise TypeError(
             f"basemap must be a preset name, dict, or folium.TileLayer; got {type(basemap)}"
         )
+
+    if "style" in spec:
+        from .maplibre_basemap import MapLibreBasemap
+
+        return MapLibreBasemap(spec["style"], attribution=spec.get("attr", ""))
 
     kwargs = dict(
         tiles=spec["tiles"],

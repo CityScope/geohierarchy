@@ -12,14 +12,6 @@ H3J_H3T_CDN = (
 )
 
 BASEMAP_STYLES = {
-    "positron": {
-        "url": "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
-        "attribution": "&copy; OpenStreetMap contributors &copy; CARTO",
-    },
-    "dark_matter": {
-        "url": "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
-        "attribution": "&copy; OpenStreetMap contributors &copy; CARTO",
-    },
     "osm": {
         "url": "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
         "attribution": "&copy; OpenStreetMap contributors",
@@ -44,7 +36,7 @@ def generate_maplibre_html(
     output_path: Union[str, Path],
     sources: Dict[str, Dict[str, Any]],
     layers: List[Dict[str, Any]],
-    basemap: str = "positron",
+    basemap: str = "osm",
     center: Optional[Sequence[float]] = None,
     zoom: int = 12,
     title: str = "Map",
@@ -154,7 +146,7 @@ def generate_mixed_html(
     output_path: Union[str, Path] = "map.html",
     layer_styles: Optional[Dict[str, Dict[str, Any]]] = None,
     zoom_ranges: Optional[Dict[str, tuple]] = None,
-    basemap: str = "positron",
+    basemap: str = "osm",
     center: Optional[Sequence[float]] = None,
     zoom: int = 12,
     title: str = "Map",

@@ -192,7 +192,7 @@ class HierarchyMap:
         self,
         hierarchy,
         levels: Optional[Sequence[str]] = None,
-        basemap: Union[str, dict, Any] = "cartodb_positron",
+        basemap: Union[str, dict, Any] = "openfreemap_positron",
         tiles_dir: Optional[str] = None,
         resolutions: Optional[Dict[str, Any]] = None,
         use_pmtiles: bool = True,
@@ -440,8 +440,12 @@ class HierarchyMap:
                     ext_max_z = min(max_z, MAX_NATIVE_TILE_ZOOM)
                     ext_min_z = min(min_z, ext_max_z)
                 self.external_tile_writers[name](
-                    level_name=name, id_col=id_col, property_cols=property_cols,
-                    min_zoom=ext_min_z, max_zoom=ext_max_z, tiles_dir=Path(self.tiles_dir),
+                    level_name=name,
+                    id_col=id_col,
+                    property_cols=property_cols,
+                    min_zoom=ext_min_z,
+                    max_zoom=ext_max_z,
+                    tiles_dir=Path(self.tiles_dir),
                 )
                 continue
 
@@ -761,7 +765,7 @@ class MultiHierarchyMap:
         self,
         named_hierarchy_maps: Dict[str, HierarchyMap],
         default: Optional[str] = None,
-        basemap: Union[str, dict, Any] = "cartodb_positron",
+        basemap: Union[str, dict, Any] = "openfreemap_positron",
         tiles_dir: Optional[str] = None,
         overlay_hierarchy_maps: Optional[Dict[str, HierarchyMap]] = None,
         overlay_show: Optional[Dict[str, bool]] = None,

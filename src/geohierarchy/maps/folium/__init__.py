@@ -2,7 +2,7 @@
 
 Example:
     >>> from geohierarchy.maps.folium import HierarchyMap, ColorSpec
-    >>> m = HierarchyMap(hierarchy, basemap="cartodb_positron", tiles_dir="tiles")
+    >>> m = HierarchyMap(hierarchy, basemap="openfreemap_positron", tiles_dir="tiles")
     >>> m.configure_level("tract", style=ColorSpec(column="population", cmap="viridis"))
     >>> m.build()
     >>> m.save("map.html")

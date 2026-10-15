@@ -34,12 +34,9 @@ MAPLIBRE_CDN = "https://unpkg.com/maplibre-gl@5.13.0/dist/maplibre-gl.js"
 MAPLIBRE_CSS_CDN = "https://unpkg.com/maplibre-gl@5.13.0/dist/maplibre-gl.css"
 PMTILES_CDN = "https://unpkg.com/pmtiles@4.5.0/dist/pmtiles.js"
 
-# CartoDB Positron/Dark Matter were replaced by the OpenFreeMap equivalents
-# below (`openfreemap_positron`/`openfreemap_dark` -- same light/dark niche,
-# no API key, no signup, OSM-based, MapLibre-native vector styles instead of
-# a third-party raster tile CDN). `openstreetmap`/`esri_imagery` stay as
-# raster options; `openfreemap_bright`/`openfreemap_liberty` and the three
-# Google raster sources are new additions.
+# Background maps: OpenFreeMap vector styles (`openfreemap_*` -- no API key, no
+# signup, OSM-based, MapLibre-native) plus a few raster options
+# (`openstreetmap`, `esri_imagery`, Google).
 #
 # Two distinct shapes live in this dict, both tagged with an explicit
 # "type":
@@ -128,8 +125,7 @@ BASEMAP_STYLES = {
     },
 }
 
-# Default basemap: OpenFreeMap Positron -- the direct replacement for the
-# old CartoDB-Positron default, same light/minimal look.
+# Default basemap: OpenFreeMap Positron (light, minimal look).
 DEFAULT_BASEMAP = "openfreemap_positron"
 
 # Labels shown in the basemap-switcher dropdown.

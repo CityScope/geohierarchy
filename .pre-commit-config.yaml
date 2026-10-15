@@ -10,3 +10,10 @@ repos:
       - id: ruff
         args: [ --fix ]  # 啟用ruff --fix自動修復，會有類似format的效果
       - id: ruff-format
+  - repo: local
+    hooks:
+      - id: check-large-files
+        name: check large files (>50 MB)
+        entry: python3 tools/check_large_files.py
+        language: system
+        pass_filenames: false
