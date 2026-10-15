@@ -119,5 +119,20 @@ api_keys.json
 !tests/**
 
 # Large generated test data / caches (must come after "!tests/**")
-tests/test_files/*.gpkg
+tests/test_files/accessibility_streets.gpkg
+tests/test_files/block.gpkg
+tests/test_files/blockgroup.gpkg
 **/__pycache__/
+
+# --- Caches and generated data. Keep this block LAST: it must come after any "!tests/**"-style re-include. ---
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+**/.ipynb_checkpoints/
+.cache/
+**/*_cache/
+population_data/
+output/
+**/map_tiles/
