@@ -119,6 +119,10 @@ class ColorSpec:
             JS source defining ``function {var_name}(properties) {{ ... }}``
             returning a Leaflet path-style object, suitable for use inside
             a ``vectorTileLayerStyles`` map.
+
+        Args:
+            gdf: Optional level data, used to sample the colour scale when the spec has no fixed domain.
+            var_name: Name of the JavaScript function.
         """
         stroke_color = self.color or "'#333333'"
         if self.color:
@@ -180,6 +184,9 @@ class ColorSpec:
             A MapLibre expression (JSON-serializable list), usable directly
             as a ``"fill-color"``/``"circle-color"``/``"line-color"`` paint
             value.
+
+        Args:
+            gdf: Optional level data, used to sample the colour scale when the spec has no fixed domain.
         """
         if self.kind == "categorical":
             cats = self._resolved_categories(gdf)

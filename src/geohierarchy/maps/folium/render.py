@@ -261,7 +261,17 @@ class HierarchyMap:
         self.fallback_level: Optional[str] = None
 
     def set_fallback_level(self, level: str) -> "HierarchyMap":
-        """Mark `level` (normally the coarsest) as an always-rendered fallback -- see `fallback_level`."""
+        """Mark `level` (normally the coarsest) as an always-rendered fallback -- see `fallback_level`.
+
+        Args:
+            level: Name of a level of this map (normally the coarsest).
+
+        Returns:
+            This map (for chaining).
+
+        Raises:
+            KeyError: If ``level`` is not one of the map's levels.
+        """
         if level not in self.levels:
             raise KeyError(
                 f"Level '{level}' is not part of this HierarchyMap ({self.levels})"
@@ -739,6 +749,14 @@ class HierarchyMap:
         Requires :meth:`build` to have already been run (PMTiles must
         exist under ``self.tiles_dir``), and ``path`` must be saved next to
         ``self.tiles_dir`` (same relative-URL convention as :meth:`save`).
+
+        Args:
+            path: HTML file to write, next to ``self.tiles_dir``.
+            basemap: Basemap name or spec; ``None`` = the MapLibre default.
+            title: Page title.
+
+        Returns:
+            The written path.
         """
         from ..maplibre.render import save_maplibre as _save_maplibre, DEFAULT_BASEMAP
 
@@ -907,6 +925,27 @@ class MultiHierarchyMap:
         given, `save_multi_maplibre` adds the matching live dropdowns/
         sliders to the layer-switcher panel. Omitted entirely when not
         passed (caller has no such fields), matching prior behavior.
+
+        Args:
+            path: HTML file to write, next to the children's tiles folders.
+            basemap: Basemap name or spec; ``None`` = the MapLibre default.
+            title: Page title.
+            radius_field_domains: ``{field: (min, max)}`` for the "Circle size by" control.
+            opacity_field_domains: ``{field: (min, max)}`` for the "Opacity by" control.
+            circle_fields: Fields offered in "Circle size by".
+            opacity_fields: Fields offered in "Opacity by".
+            default_circle_field: Field selected first in "Circle size by".
+            field_labels: ``{field: display text}`` for those dropdowns.
+            radius_field_domains_by_res: ``{H3 resolution: {field: (min, max)}}``: per-resolution circle domains.
+            circle_zoom_bands: ``{H3 resolution: (min zoom, max zoom)}`` of each resolution's circles.
+            special_group_levels: Levels of the special group shown one at a time (picked by hand, not by zoom).
+            special_group_level_labels: ``{level: display text}`` for the special-level dropdown.
+            special_group_name: Name of the special group.
+            special_group_fallback_level: Special level shown below ``special_group_fallback_zoom`` while another special level is picked.
+            special_group_fallback_zoom: Zoom below which the fallback level is shown.
+
+        Returns:
+            The written path.
         """
         from ..maplibre.render import (
             save_multi_maplibre as _save_multi_maplibre,

@@ -142,6 +142,23 @@ BASEMAP_LABELS = {
 }
 
 
+
+# JS: the layers of `ids` that can hold a feature at a point right now -- visible, inside their zoom range and (chunked sources) whose bounds
+# contain the point. queryRenderedFeatures over every layer of a nationwide page (thousands of chunk layers) costs 0.3-2 s per call; over
+# these few, milliseconds. Used by hover, click and the pages' own centre lookups.
+LIVE_LAYERS_JS = """window.__liveLayers = window.__liveLayers || function(m, ids, ll) {
+      var z = m.getZoom(), out = [];
+      if (ll && ll.wrap) ll = ll.wrap();
+      for (var i = 0; i < ids.length; i++) {
+        var L = m.getLayer(ids[i]); if (!L) continue;
+        if (m.getLayoutProperty(ids[i], 'visibility') === 'none') continue;
+        if (z < (L.minzoom || 0) || z >= (L.maxzoom == null ? 24 : L.maxzoom)) continue;
+        if (ll) { var s = m.getSource(L.source), b = s && s.bounds; if (b && (ll.lng < b[0] || ll.lng > b[2] || ll.lat < b[1] || ll.lat > b[3])) continue; }
+        out.push(ids[i]);
+      }
+      return out;
+    };"""
+
 def _extract_score_interpolator(
     color_expr: Any,
 ) -> Optional[tuple[str, List[List[Any]]]]:
@@ -389,6 +406,58 @@ def _client_basemap_js(
     return js
 
 
+# Top-left control row (zoom +/-, north arrow, and -- when a page injects one -- the language switch) plus the compact OSM attribution.
+# Shared by both map templates; plain string (not an f-string), interpolated verbatim.
+_TOPLEFT_CONTROLS_JS = r"""
+    (function() {
+      var st = document.createElement('style');
+      st.textContent =
+        '.maplibregl-ctrl-top-left{display:flex;flex-direction:row;align-items:flex-start;margin-left:var(--tl-left,0px);z-index:10003}' +
+        '.maplibregl-ctrl-top-left .maplibregl-ctrl-group{display:flex;flex-direction:row}' +
+        '.maplibregl-ctrl-top-left .maplibregl-ctrl-group button+button{border-top:0;border-left:1px solid #ddd}' +
+        '#lang-switch{position:fixed!important;top:10px!important;right:auto!important;left:calc(var(--tl-left,0px) + 106px)!important;opacity:.9!important;' +
+        'background:rgba(255,255,255,.92);border-radius:4px;padding:6px 7px;box-shadow:0 0 0 2px rgba(0,0,0,.1)}';
+      document.head.appendChild(st);
+      map.addControl(new maplibregl.NavigationControl({visualizePitch: false}), 'top-left');
+      map.addControl(new maplibregl.AttributionControl({compact: true}), 'bottom-right');
+      // Collapsed by default: MapLibre opens a compact control the first time it fills it, so keep closing it until the user
+      // clicks the (i) button; after that the control behaves normally (click to expand / collapse).
+      var attribTouched = false;
+      document.addEventListener('mousedown', function(e) { if (e.target.closest && e.target.closest('.maplibregl-ctrl-attrib-button')) attribTouched = true; }, true);
+      document.addEventListener('touchstart', function(e) { if (e.target.closest && e.target.closest('.maplibregl-ctrl-attrib-button')) attribTouched = true; }, true);
+      function collapseAttrib() {
+        document.querySelectorAll('.maplibregl-ctrl-attrib').forEach(function(a) {
+          if (!a.dataset.tlInit) {
+            a.dataset.tlInit = '1';
+            new MutationObserver(function() { if (attribTouched) return; if (a.hasAttribute('open')) a.removeAttribute('open'); if (a.classList.contains('maplibregl-compact-show')) a.classList.remove('maplibregl-compact-show'); })
+              .observe(a, {attributes: true, attributeFilter: ['open', 'class']});
+          }
+          if (!attribTouched) { if (a.hasAttribute('open')) a.removeAttribute('open'); if (a.classList.contains('maplibregl-compact-show')) a.classList.remove('maplibregl-compact-show'); }
+        });
+      }
+      collapseAttrib(); map.once('load', collapseAttrib); map.on('idle', collapseAttrib); setTimeout(collapseAttrib, 800);
+      // Sit to the right of the "Draw a new line" button when the page has one (it is hidden at low zoom).
+      function place() {
+        var b = document.getElementById('routeEditToggleBtn'), left = 0;
+        if (b && b.offsetParent !== null) left = Math.round(b.getBoundingClientRect().right);
+        document.documentElement.style.setProperty('--tl-left', left + 'px');
+      }
+      place(); setInterval(place, 600);
+      // Development overlay: only active (and only loaded) at high zoom; below it the layer is outside its zoom range, so
+      // MapLibre neither renders it nor requests its tiles even when the checkbox is on.
+      window.__devMinZoom = window.__devMinZoom || 9;
+      function devZoom() {
+        try {
+          map.getStyle().layers.forEach(function(l) {
+            if (/development/.test(l.id) && map.getLayer(l.id)) map.setLayerZoomRange(l.id, window.__devMinZoom, 24);
+          });
+        } catch (e) {}
+      }
+      if (map.isStyleLoaded()) devZoom(); else map.once('load', devZoom);
+    })();
+"""
+
+
 def _default_popup_js(popup_fields: Optional[List[str]]) -> str:
     fields_json = json.dumps(popup_fields or [])
     return (
@@ -520,7 +589,18 @@ def _custom_select_js() -> str:
 
     function buildList() {
       list.innerHTML = '';
-      Array.prototype.forEach.call(sel.options, function(opt, i) {
+      // Column dropdowns: simplified list unless "Extended census" is on, ordered by relevance (see transitlos.map.col_select).
+      var order = Array.prototype.map.call(sel.options, function(o, i) { return i; });
+      var vals = Array.prototype.map.call(sel.options, function(o) { return o.value; });
+      var isCol = window.__colOrderFor && /^(circleFieldSelect|opacitySelect|distMainSelect|distOverlaySelect|regFieldSelect|placeRankWeightSelect)$/.test(sel.id || '');
+      if (isCol) {
+        var head = vals[0] === 'none' ? [0] : [];
+        var ordered = window.__colOrderFor(sel.id, vals.filter(function(v, i) { return head.indexOf(i) < 0; }));
+        order = head.concat(ordered.map(function(v) { return vals.indexOf(v); }));
+      }
+      order.forEach(function(i) {
+        var opt = sel.options[i];
+        if (isCol && window.__colVisible && i !== sel.selectedIndex && !window.__colVisible(opt.value) && opt.value !== 'none') return;
         var item = document.createElement('div');
         item.className = '__csel-item' + (i === sel.selectedIndex ? ' __csel-sel' : '');
         item.textContent = opt.textContent;
@@ -925,6 +1005,13 @@ class MapLibreHierarchyMap:
                     "url": pmtiles_url,
                     "maxzoom": native_max_z,
                 }
+                # tile template + bounds / zooms from the archive's own header: MapLibre then reads nothing until a tile of this source is
+                # needed (a `url` source has its header fetched at start-up, visible or not -- thousands of requests on a nationwide page)
+                from .pmtiles_meta import lazy_source
+
+                lazy = lazy_source(f"{tiles_dir_rel}/{rel_pmtiles}", Path(hmap.tiles_dir) / rel_pmtiles, native_max_z)
+                if lazy is not None:
+                    source_cfg = {"type": "vector", **lazy}
                 if id_col:
                     source_cfg["promoteId"] = {name: id_col}
                 sources[source_id] = source_cfg
@@ -993,6 +1080,10 @@ class MapLibreHierarchyMap:
         relative to the output HTML file's own directory (same convention
         Folium's output uses), so this HTML must be saved next to
         ``hmap.tiles_dir`` (see :meth:`save`).
+
+        Args:
+            basemap: Basemap name or spec.
+            title: Page title.
         """
         hmap = self.hmap
         tiles_dir_name = Path(hmap.tiles_dir).name
@@ -1110,6 +1201,7 @@ class MapLibreHierarchyMap:
     {recolor_js}
     const popupFns = {popup_lookup_js};
     const interactiveLayerIds = {json.dumps(interactive_layer_ids)};
+    {LIVE_LAYERS_JS}
     // `maxWidth` explicit (2026-09-01, live user report): MapLibre's own
     // default (240px) was clamping this popup well below the 480px the
     // shape popup's own inner content (`_shape_popup_js` in transitLOS,
@@ -1142,9 +1234,13 @@ class MapLibreHierarchyMap:
       if (priorityLayers.length && map.queryRenderedFeatures(e.point, {{layers: priorityLayers}}).length) {{
         return;
       }}
-      const features = map.queryRenderedFeatures(e.point, {{layers: interactiveLayerIds}});
+      // No cell/hexagon popups at very low zoom (e.g. the whole-country view): cells are sub-pixel there.
+      if (map.getZoom() < (window.__minCellPopupZoom != null ? window.__minCellPopupZoom : 6)) return;
+      const features = (function(ls) {{ return ls.length ? map.queryRenderedFeatures(e.point, {{layers: ls}}) : []; }})(window.__liveLayers(map, interactiveLayerIds, e.lngLat));
       if (!features.length) return;
       const f = features[0];
+      // A page can take over the click popup (transitlos: always the H3 res-7 cell under the point, with percentiles).
+      if (window.__openCellPopup && window.__openCellPopup(e.lngLat.lng, e.lngLat.lat, {{feature: f}})) return;
       const fn = popupFns[f.layer.id];
       const html = fn ? fn(f.properties) : JSON.stringify(f.properties);
       popup.setLngLat(e.lngLat).setHTML(html).addTo(map);
@@ -1154,7 +1250,7 @@ class MapLibreHierarchyMap:
     let hoveredLayer = null;
     map.on('mousemove', function(e) {{
       if (!map.isStyleLoaded()) return;
-      const features = map.queryRenderedFeatures(e.point, {{layers: interactiveLayerIds}});
+      const features = (function(ls) {{ return ls.length ? map.queryRenderedFeatures(e.point, {{layers: ls}}) : []; }})(window.__liveLayers(map, interactiveLayerIds, e.lngLat));
       map.getCanvas().style.cursor = features.length ? 'pointer' : '';
       if (hoveredId !== null && hoveredLayer) {{
         map.setFeatureState({{source: hoveredLayer, id: hoveredId}}, {{hover: false}});
@@ -1201,7 +1297,12 @@ class MapLibreHierarchyMap:
       center: {json.dumps(center)},
       zoom: {initial_zoom},
       maxZoom: 24,
+      // Slightly higher render resolution than the device default (sharper lines / text / icons).
+      pixelRatio: Math.min(3, Math.max(1.5, (window.devicePixelRatio || 1) * 1.25)),
+      // The OSM/OpenMapTiles attribution is added below as a compact (collapsed, click to expand) control.
+      attributionControl: false,
     }});
+    window.__map = map;
     // Exposed on `window` (2026-09-01, for `code.combined_map`'s zoom-based
     // overview<->city auto-switch): `const map` alone is only reachable
     // from code inside this same `<script>` block. The combined page reads
@@ -1216,7 +1317,7 @@ class MapLibreHierarchyMap:
     // `pad_factor` comment for why it's deliberately much lower than the
     // map's own startup zoom, not just one step lower.
     window.__overviewExitZoom = {overview_exit_zoom};
-    map.addControl(new maplibregl.NavigationControl(), 'top-right');
+    {_TOPLEFT_CONTROLS_JS}
     {basemap_bootstrap_js}
     {interaction_js}
   </script>
@@ -1239,11 +1340,19 @@ class MapLibreHierarchyMap:
         URLs baked into the generated HTML -- exactly the convention
         Folium's own ``HierarchyMap.save()`` output already relies on for
         its XYZ tile URLs.
+
+        Args:
+            path: HTML file to write, next to ``hmap.tiles_dir``.
+            basemap: Basemap name or spec.
+            title: Page title.
+
+        Returns:
+            The written path.
         """
         html = self.build_html(basemap=basemap, title=title)
         out = Path(path)
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(html)
+        out.write_text(html, encoding="utf-8")
         return str(out)
 
 
@@ -1253,7 +1362,17 @@ def save_maplibre(
     basemap: Union[str, Dict[str, Any]] = DEFAULT_BASEMAP,
     title: str = "Map",
 ) -> str:
-    """Convenience wrapper: ``save_maplibre(hmap, "map_maplibre.html")``."""
+    """Convenience wrapper: ``save_maplibre(hmap, "map_maplibre.html")``.
+
+    Args:
+        hmap: A built :class:`~geohierarchy.maps.folium.render.HierarchyMap`.
+        path: HTML file to write.
+        basemap: Basemap name or spec.
+        title: Page title.
+
+    Returns:
+        The written path.
+    """
     return MapLibreHierarchyMap(hmap).save(path, basemap=basemap, title=title)
 
 
@@ -1361,6 +1480,28 @@ def save_multi_maplibre(
     lets the legend TEXT pick the domain matching the map's current zoom.
     Both optional and additive -- omitting them keeps the old flat-domain
     behavior for a caller that doesn't pass them.
+
+    Args:
+        multi: A built :class:`~geohierarchy.maps.folium.render.MultiHierarchyMap`.
+        path: HTML file to write.
+        basemap: Basemap name or spec.
+        title: Page title.
+        radius_field_domains: ``{field: (min, max)}`` for the "Circle size by" control.
+        opacity_field_domains: ``{field: (min, max)}`` for the "Opacity by" control.
+        circle_fields: Fields offered in "Circle size by".
+        opacity_fields: Fields offered in "Opacity by".
+        default_circle_field: Field selected first in "Circle size by".
+        field_labels: ``{field: display text}`` for those dropdowns.
+        radius_field_domains_by_res: ``{H3 resolution: {field: (min, max)}}``: per-resolution circle domains.
+        circle_zoom_bands: ``{H3 resolution: (min zoom, max zoom)}`` of each resolution's circles.
+        special_group_levels: Levels of the special group shown one at a time (picked by hand, not by zoom).
+        special_group_level_labels: ``{level: display text}`` for the special-level dropdown.
+        special_group_name: Name of the special group.
+        special_group_fallback_level: Special level shown below ``special_group_fallback_zoom`` while another special level is picked.
+        special_group_fallback_zoom: Zoom below which the fallback level is shown.
+
+    Returns:
+        The written path.
     """
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -1643,8 +1784,8 @@ def save_multi_maplibre(
     <hr>
     <div style="margin-top:4px;">
       {"<div id='circleSizeByRow'><label style='display:block;'>Circle size by<br><select id='circleFieldSelect' style='width:100%;'>" + circle_field_options_html + "</select></label></div>" if circle_field_options_html else ""}
-      <label style="display:block;margin-top:6px;">Hex/circle/census opacity <span id="shapeOpacityValue">100%</span><br>
-        <input type="range" id="shapeOpacitySlider" min="0" max="100" value="100" style="width:100%;">
+      <label style="display:block;margin-top:6px;">Hex/circle/census opacity <span id="shapeOpacityValue">75%</span><br>
+        <input type="range" id="shapeOpacitySlider" min="0" max="100" value="75" style="width:100%;">
       </label>
       <label style="display:block;margin-top:6px;">Opacity by<br>
         <select id="opacitySelect" style="width:100%;">
@@ -1679,7 +1820,8 @@ def save_multi_maplibre(
       var best = null;
       Object.keys(__circleZoomBands).forEach(function(resKey) {{
         var band = __circleZoomBands[resKey];
-        if (z >= band[0] && z <= band[1]) best = resKey;
+        // Layers are drawn for minzoom <= z < maxzoom + 1 (maxzoom exclusive), i.e. floor(z) inside the inclusive band.
+        if (z + 1e-9 >= band[0] && z < band[1] + 1) best = resKey;   // bands may start at fractional zooms (see circle_bands.py)
       }});
       if (best != null) return best;
       var keys = Object.keys(__circleZoomBands).map(Number);
@@ -1702,7 +1844,7 @@ def save_multi_maplibre(
     window.__shapeLayerIdTypes = __shapeLayerIdTypes;
     window.__opacityField = 'none';
     window.__opacityContrast = 0.5;
-    window.__shapeOpacity = 1;
+    window.__shapeOpacity = 0.75;
     window.__circleField = {json.dumps(default_circle_field)};
 
     function __domainsForLayer(id) {{
@@ -1720,26 +1862,49 @@ def save_multi_maplibre(
     // silently OVERWRITING that Python-side static per-resolution fix
     // with the same flat 18px the moment the page loaded. Kept in
     // lockstep with the Python tiers.
-    var __circleMaxRadiusByRes = {{'5': 18, '7': 14, '9': 9, '11': 5}};
+    var __circleMaxRadiusByRes = {{'5': 18, '7': 17, '8': 16, '9': 14, '10': 12, '11': 11}};
     function __maxRadiusForLayer(id) {{
       var res = __resFromLayerId(id);
-      return (res != null && __circleMaxRadiusByRes[res] != null) ? __circleMaxRadiusByRes[res] : 18;
+      var m = window.__circleMaxByRes || __circleMaxRadiusByRes;
+      return (res != null && m[res] != null) ? m[res] : 18;
     }}
-    function __circleRadiusExpr(field, domains, maxRadius) {{
-      const d = (domains || __radiusFieldDomains)[field];
+    // radius = 3 px + (max - 3 px) * sqrt(share of the value in the resolution's own domain) -- identical to
+    // `transitlos.map.build._circle_radius_expr`.
+    function __circleRadiusExpr(field, domains, maxRadius, minRadius) {{
+      var r0 = minRadius == null ? __CIRC_MIN : minRadius;
+      // radius = 3 px + (max - 3 px) * (value / domain max) ** 0.7 -- identical to `transitlos.map.build._circle_radius_expr`: starts at 0 and
+      // stays near the minimum for low populations, so merging two small circles at a coarser zoom never makes a visibly thicker circle.
+      var d = field && domains ? domains[field] : null;
       if (!d) return 5;
-      const d0 = d[0], d1 = (d[1] > d[0] ? d[1] : d[0] + 1e-9);
-      // Item 8 null-guard (same fix as `_circle_radius_expr`/
-      // `_score_maplibre_paint` in transitlos.map.build): a feature missing
-      // `field` would otherwise throw "Expected value to be of type
-      // number, but found null instead."
-      return ['interpolate', ['linear'], ['coalesce', ['get', field], d0], d0, 3, d1, (maxRadius != null ? maxRadius : 18)];
+      var d1 = d[1] > 0 ? d[1] : 1e-9;
+      var share = ['max', 0, ['min', 1, ['/', ['coalesce', ['get', field], 0], d1]]];
+      return ['+', r0, ['*', maxRadius - r0, ['^', share, __CIRC_EXP]]];
+    }}
+    // The SAME radius function in plain JS (legend circles): px radius of a value `v` in a domain whose max is `d1`.
+    var __CIRC_MIN = 3, __CIRC_EXP = 0.7;
+    function __circleRadiusPx(v, d1, maxRadius, minRadius) {{
+      var r0 = minRadius == null ? __CIRC_MIN : minRadius;
+      var sh = Math.max(0, Math.min(1, (v || 0) / (d1 > 0 ? d1 : 1e-9)));
+      return r0 + (maxRadius - r0) * Math.pow(sh, __CIRC_EXP);
+    }}
+    // Neighbouring H3 cell centres are ~this many km apart, a distance that doubles on screen with every zoom level. The radius range follows
+    // that spacing at the zoom drawn: the largest circle 1.1x the spacing (capped by the resolution's fixed maximum; with the size domain ending at the 99.5th percentile only the densest cells get near it), the smallest 0.22x
+    // (1.2-3 px) -- dense areas never merge into a solid carpet, sparse ones never vanish, and circles grow as one zooms in.
+    var __H3_SPACING_KM = {{3: 119.6, 4: 45.2, 5: 17.09, 6: 6.46, 7: 2.441, 8: 0.9227, 9: 0.3487, 10: 0.1318, 11: 0.04982, 12: 0.01883}};
+    function __radiusRangeAt(id, z) {{   // [min, max] radius (px)
+      var cap = __maxRadiusForLayer(id), km = __H3_SPACING_KM[__resFromLayerId(id)];
+      if (!km) return [__CIRC_MIN, cap];
+      var px = km * 256 * Math.pow(2, z) / (40075 * Math.cos(map.getCenter().lat * Math.PI / 180));
+      var r0 = Math.max(1.2, Math.min(__CIRC_MIN, 0.22 * px));
+      return [r0, Math.max(r0 + 1, Math.min(cap, 1.1 * px))];
     }}
     function __applyCircleRadius() {{
       __circleLayerIds.forEach(function(id) {{
-        if (map.getLayer(id)) {{
-          map.setPaintProperty(id, 'circle-radius', __circleRadiusExpr(window.__circleField, __domainsForLayer(id), __maxRadiusForLayer(id)));
-        }}
+        var L = map.getLayer(id); if (!L) return;
+        var lo = L.minzoom || 0, hi = Math.min(L.maxzoom == null ? 24 : L.maxzoom, lo + 4), d = __domainsForLayer(id), f = window.__circleField;
+        var a = __radiusRangeAt(id, lo), b = __radiusRangeAt(id, hi);
+        map.setPaintProperty(id, 'circle-radius', a[0] === b[0] && a[1] === b[1] ? __circleRadiusExpr(f, d, a[1], a[0])
+          : ['interpolate', ['exponential', 2], ['zoom'], lo, __circleRadiusExpr(f, d, a[1], a[0]), hi, __circleRadiusExpr(f, d, b[1], b[0])]);
       }});
     }}
     // Legend sub-sections (`#circleLegend`/`#opacityLegend`/`#devLegend` --
@@ -1806,10 +1971,34 @@ def save_multi_maplibre(
       if (!show) return;
       var opt = __circleFieldSelect ? __circleFieldSelect.options[__circleFieldSelect.selectedIndex] : null;
       document.getElementById('circleLegendField').textContent = opt ? opt.textContent : field;
-      var refAbs = Math.max(Math.abs(d[0]), Math.abs(d[1]));
-      document.getElementById('circleLegendMin').textContent = __fmtLeg(d[0], field, refAbs);
-      document.getElementById('circleLegendMid').textContent = __fmtLeg((d[0] + d[1]) / 2, field, refAbs);
-      document.getElementById('circleLegendMax').textContent = __fmtLeg(d[1], field, refAbs);
+      // Legend circles: three representative NON-ZERO values of the distribution of the resolution on screen (class means,
+      // `window.__legendByRes`); each legend circle is drawn with the very radius function the map layers use
+      // (`__circleRadiusPx` == `__circleRadiusExpr`) for that resolution's domain and max radius, from the value as displayed.
+      var res = __resForZoom(map.getZoom());
+      var L = window.__legendByRes || {{}}, keys = Object.keys(L).map(Number).sort(function(a, b) {{ return a - b; }}), best = null;
+      keys.forEach(function(k) {{ if (best == null || Math.abs(k - Number(res)) < Math.abs(best - Number(res))) best = k; }});
+      var dom = (__radiusFieldDomainsByRes[res] && __radiusFieldDomainsByRes[res][field]) || d;
+      var d1 = dom[1] > 0 ? dom[1] : 1e-9;
+      var isPct = !!(window.__isPercentField && window.__isPercentField(field));
+      var rr = __radiusRangeAt('h3_' + res, map.getZoom()), rmax = rr[1];
+      var raw = best != null && L[best] && L[best][field] ? L[best][field].slice() : [d1 / 50, d1 / 8, d1 / 2];
+      var shown = function(v) {{   // the number the label prints (whole numbers, k / M), as a value
+        if (isPct) return v;
+        var a = Math.abs(v);
+        if (a >= 1e6) return Math.round(v / 1e6) * 1e6;
+        if (a >= 1e3) return Math.round(v / 1e3) * 1e3;
+        return Math.round(v);
+      }};
+      var floor = isPct ? Math.min.apply(null, raw.filter(function(x) {{ return x > 0; }}).concat([d1 / 100])) : 1;
+      var vals = raw.map(function(v) {{ v = shown(v); return v > 0 && v >= floor ? v : shown(Math.max(floor, 1e-9)); }});
+      for (var q = 1; q < 3; q++) if (vals[q] <= vals[q - 1]) vals[q] = shown(Math.max(vals[q - 1] * 2, vals[q - 1] + 1));   // strictly increasing
+      var ids = ['circleLegendMin', 'circleLegendMid', 'circleLegendMax'];
+      vals.forEach(function(v, i) {{
+        var c = document.getElementById('circleLegendC' + (i + 1));
+        var r = __circleRadiusPx(v, d1, rmax, rr[0]);
+        if (c) {{ c.style.width = c.style.height = (2 * r) + 'px'; c.dataset.value = v; c.dataset.radius = r; c.dataset.res = res; if (c.parentNode) c.parentNode.style.width = Math.max(30, Math.ceil(2 * r) + 4) + 'px'; }}
+        document.getElementById(ids[i]).textContent = __fmtLeg(v, field, 0);
+      }});
     }}
     var __circleFieldSelect = document.getElementById('circleFieldSelect');
     if (__circleFieldSelect) {{
@@ -1818,12 +2007,14 @@ def save_multi_maplibre(
         __applyCircleRadius();
         __updateCircleLegend();
       }});
-      __applyCircleRadius();
+      if (map.loaded()) __applyCircleRadius(); else map.once('load', __applyCircleRadius);   // the layers exist only once the style has loaded
     }}
     if (typeof map !== 'undefined' && map.on && Object.keys(__circleZoomBands).length) {{
       map.on('zoomend', __updateCircleLegend);
     }}
     __updateCircleLegend();
+    setTimeout(__updateCircleLegend, 1500);   // again once the stats data (the legend's means) has loaded
+    window.addEventListener('load', function() {{ setTimeout(__updateCircleLegend, 500); }});
 
     // Mirrors `opacityFromField` in `transitlos/map/build.py`'s
     // `_opacity_helper_js` exactly: percentile-clipped-domain normalize,
@@ -1831,13 +2022,20 @@ def save_multi_maplibre(
     // slider. Built as a MapLibre expression (not a JS function) since
     // paint properties are per-feature and MapLibre evaluates expressions
     // per-feature on the GPU/tile-worker side, not via a JS callback.
-    function __shapeOpacityExpr(baseOp) {{
+    function __shapeOpacityExpr(baseOp, layerId) {{
       var field = window.__opacityField;
       var shape = window.__shapeOpacity;
       if (!field || field === 'none' || !__opacityFieldDomains[field]) {{
         return Math.max(0, Math.min(1, baseOp * shape));
       }}
       var d = __opacityFieldDomains[field];
+      // count columns (2026-11-13: opacity by counts): each H3 resolution gets its own value range (a res-7 cell holds ~340x a res-10 one)
+      var lr = layerId ? __resFromLayerId(layerId) : null;
+      if (lr != null && __radiusFieldDomainsByRes[lr] && __radiusFieldDomainsByRes[lr][field]) d = __radiusFieldDomainsByRes[lr][field];
+      else if (lr == null && layerId) {{   // census polygons (sections / blocks ~ a mid resolution): the middle H3 resolution's range
+        var ks = Object.keys(__radiusFieldDomainsByRes).filter(function(k) {{ return __radiusFieldDomainsByRes[k][field]; }}).map(Number).sort(function(a, b) {{ return a - b; }});
+        if (ks.length) d = __radiusFieldDomainsByRes[ks[Math.floor(ks.length / 2)]][field];
+      }}
       var span = Math.max(d[1] - d[0], 1e-9);
       var c = Math.max(0, Math.min(1, window.__opacityContrast));
       var minOp = 1 - 0.95 * c, maxOp = 1;
@@ -1872,7 +2070,7 @@ def save_multi_maplibre(
         if (!map.getLayer(id)) return;
         var type = __shapeLayerIdTypes[id];
         var prop = type === 'circle' ? 'circle-opacity' : 'fill-opacity';
-        map.setPaintProperty(id, prop, __shapeOpacityExpr(0.75));
+        map.setPaintProperty(id, prop, __shapeOpacityExpr(0.75, id));
       }});
     }}
     document.getElementById('shapeOpacitySlider').addEventListener('input', function(e) {{
@@ -1886,6 +2084,10 @@ def save_multi_maplibre(
       if (!el) return;
       var field = window.__opacityField;
       var d = (field && field !== 'none') ? __opacityFieldDomains[field] : null;
+      if (d && typeof map !== 'undefined' && map.getZoom) {{   // the range of the resolution on screen (see __shapeOpacityExpr)
+        var rz = __resForZoom(map.getZoom());
+        if (rz != null && __radiusFieldDomainsByRes[rz] && __radiusFieldDomainsByRes[rz][field]) d = __radiusFieldDomainsByRes[rz][field];
+      }}
       el.style.display = d ? 'block' : 'none';
       if (!d) return;
       var sel = document.getElementById('opacitySelect');
@@ -1899,6 +2101,7 @@ def save_multi_maplibre(
       __applyShapeOpacity();
       __updateOpacityLegend();
     }});
+    map.on('zoomend', function() {{ if (window.__opacityField && window.__opacityField !== 'none') __updateOpacityLegend(); }});
     document.getElementById('opacityContrastSlider').addEventListener('input', function(e) {{
       var pct = parseInt(e.target.value, 10);
       window.__opacityContrast = pct / 100;
@@ -2110,6 +2313,7 @@ def save_multi_maplibre(
     {recolor_js}
     const popupFns = {popup_lookup_js};
     const interactiveLayerIds = {json.dumps(interactive_layer_ids)};
+    {LIVE_LAYERS_JS}
     // `maxWidth` explicit (2026-09-01, live user report): MapLibre's own
     // default (240px) was clamping this popup well below the 480px the
     // shape popup's own inner content (`_shape_popup_js` in transitLOS,
@@ -2137,9 +2341,13 @@ def save_multi_maplibre(
       if (priorityLayers.length && map.queryRenderedFeatures(e.point, {{layers: priorityLayers}}).length) {{
         return;
       }}
-      const features = map.queryRenderedFeatures(e.point, {{layers: interactiveLayerIds}});
+      // No cell/hexagon popups at very low zoom (e.g. the whole-country view): cells are sub-pixel there.
+      if (map.getZoom() < (window.__minCellPopupZoom != null ? window.__minCellPopupZoom : 6)) return;
+      const features = (function(ls) {{ return ls.length ? map.queryRenderedFeatures(e.point, {{layers: ls}}) : []; }})(window.__liveLayers(map, interactiveLayerIds, e.lngLat));
       if (!features.length) return;
       const f = features[0];
+      // A page can take over the click popup (transitlos: always the H3 res-7 cell under the point, with percentiles).
+      if (window.__openCellPopup && window.__openCellPopup(e.lngLat.lng, e.lngLat.lat, {{feature: f}})) return;
       const fn = popupFns[f.layer.id];
       const html = fn ? fn(f.properties) : JSON.stringify(f.properties);
       popup.setLngLat(e.lngLat).setHTML(html).addTo(map);
@@ -2152,7 +2360,7 @@ def save_multi_maplibre(
     let hoveredSourceLayer = null;
     map.on('mousemove', function(e) {{
       if (!map.isStyleLoaded()) return;
-      const features = map.queryRenderedFeatures(e.point, {{layers: interactiveLayerIds}});
+      const features = (function(ls) {{ return ls.length ? map.queryRenderedFeatures(e.point, {{layers: ls}}) : []; }})(window.__liveLayers(map, interactiveLayerIds, e.lngLat));
       map.getCanvas().style.cursor = features.length ? 'pointer' : '';
       if (hoveredId !== null && hoveredLayer) {{
         map.setFeatureState({{source: hoveredLayer, sourceLayer: hoveredSourceLayer, id: hoveredId}}, {{hover: false}});
@@ -2188,7 +2396,7 @@ def save_multi_maplibre(
     html, body {{ width: 100%; height: 100%; }}
     #map {{ width: 100%; height: 100%; }}
     #layer-switcher {{
-      position: absolute; top: 10px; right: 50px; z-index: 5;
+      position: absolute; top: 10px; right: 10px; z-index: 5;
       background: white; padding: 8px 10px; border-radius: 4px;
       box-shadow: 0 1px 4px rgba(0,0,0,0.3); font: 12px sans-serif;
       max-height: 90vh; overflow-y: auto; width: 220px;
@@ -2286,7 +2494,12 @@ def save_multi_maplibre(
       center: {json.dumps(center)},
       zoom: {initial_zoom},
       maxZoom: 24,
+      // Slightly higher render resolution than the device default (sharper lines / text / icons).
+      pixelRatio: Math.min(3, Math.max(1.5, (window.devicePixelRatio || 1) * 1.25)),
+      // The OSM/OpenMapTiles attribution is added below as a compact (collapsed, click to expand) control.
+      attributionControl: false,
     }});
+    window.__map = map;
     // Exposed on `window` (2026-09-01, for `code.combined_map`'s zoom-based
     // overview<->city auto-switch): `const map` alone is only reachable
     // from code inside this same `<script>` block. The combined page reads
@@ -2301,7 +2514,7 @@ def save_multi_maplibre(
     // `pad_factor` comment for why it's deliberately much lower than the
     // map's own startup zoom, not just one step lower.
     window.__overviewExitZoom = {overview_exit_zoom};
-    map.addControl(new maplibregl.NavigationControl(), 'top-right');
+    {_TOPLEFT_CONTROLS_JS}
     {switcher_js}
     {basemap_controls_js}
     {style_controls_js}
@@ -2311,7 +2524,7 @@ def save_multi_maplibre(
 </body>
 </html>
 """
-    out.write_text(html)
+    out.write_text(html, encoding="utf-8")
     return str(out)
 
 
@@ -2567,7 +2780,7 @@ def _route_draw_html_js() -> tuple[str, str]:
           paint: {
             'icon-color': ['interpolate', ['linear'], ['coalesce', ['get', 'stop_score'], 0],
               0, '#deebf7', 25, '#9ecae1', 50, '#4292c6', 75, '#2171b5', 100, '#084594'],
-            'icon-halo-color': '#ffffff', 'icon-halo-width': 1,
+            'icon-halo-color': '#000000', 'icon-halo-width': 1.6,
           },
         });
         // Same small stop-score text label under the icon as the base

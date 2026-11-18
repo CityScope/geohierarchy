@@ -30,7 +30,8 @@ from .utils import (
     area,
     length,
 )
-from .aggregation import AggregationStrategy, aggregation_strategy
+from ._backend import array_module, to_numpy
+from .aggregation import AggregationStrategy, Sum, aggregation_strategy
 
 
 # ================================================================
@@ -124,7 +125,7 @@ class GeoHierarchy:
     # INIT
     # ================================================================
 
-    def __init__(self, crs: Any = "EPSG:4326") -> None:
+    def __init__(self, crs: Any = "EPSG:4326", capacity_split: bool = True) -> None:
         """Initialize an empty hierarchy.
 
         Args:
@@ -137,6 +138,7 @@ class GeoHierarchy:
         self.levels: Dict[str, pl.DataFrame] = {}
         self.geometries: Dict[str, gpd.GeoDataFrame] = {}
         self.id_cols: Dict[str, str] = {}
+        self.capacity_split = capacity_split   # additive downscales share a parent by AREA covered, not by the cells present (see _capacity_share)
         self.geoweight_by: Dict[str, str] = {}
 
         self.parents: Dict[str, Set[str]] = {}
@@ -894,6 +896,20 @@ class GeoHierarchy:
                 exprs += agg.upscale_aggs([col])
             return joined.group_by(self.id_cols[dst]).agg(exprs)
 
+        cap = [(c, a) for c, a in zip(columns, aggs) if a.mapping != "knn" and self._capacity_ok(a, src, dst)]
+        if cap:   # additive columns: split by the area each child covers of its parent (see _capacity_share)
+            cap_cols = {c for c, _ in cap}
+            part = None
+            for c, _a in cap:
+                one = self._capacity_share(c, mapping, src, dst)
+                part = one if part is None else part.join(one, on=self.id_cols[dst], how="full", coalesce=True)
+            rest = [(c, a) for c, a in zip(columns, aggs) if c not in cap_cols]
+            if not rest:
+                return part
+            columns, aggs = [c for c, _ in rest], [a for _, a in rest]
+            tail = self._aggregate_edge_batch(columns, aggs, mapping, src, dst, upscale)
+            return part.join(tail, on=self.id_cols[dst], how="full", coalesce=True)
+
         exprs = []
         for col, agg in zip(columns, aggs):
             exprs += agg.downscale_exprs([col], self.id_cols[src])
@@ -953,6 +969,77 @@ class GeoHierarchy:
             rescale_exprs.append((pl.col(col) * (src_total / dst_total)).alias(col))
 
         return result.with_columns(rescale_exprs) if rescale_exprs else result
+
+    # ================================================================
+    # CAPACITY SPLIT (additive downscale over a grid that need not cover its parent)
+    # ================================================================
+
+    def _capacity_ok(self, agg: AggregationStrategy, src: str, dst: str) -> bool:
+        """The capacity split applies to a plain additive (Sum) column between two polygon levels."""
+        return (
+            self.capacity_split
+            and isinstance(agg, Sum)
+            and agg.weight_column is None
+            and self.geoweight_by.get(src) == "area"
+            and self.geoweight_by.get(dst) == "area"
+        )
+
+    def _capacity_share(
+        self, col: str, mapping: pl.DataFrame, src: str, dst: str, existing: Optional[pl.DataFrame] = None
+    ) -> pl.DataFrame:
+        """What each child row gets of its parents' totals, by the share of the parent's AREA it covers.
+
+        The old split normalised over the child rows that *exist*: a parent only partly covered by the child level (e.g. a street-touching H3 grid with no cells over
+        roads-less land, or a census unit reaching outside the study area) handed its WHOLE total to the few cells present, piling thousands of people onto a single cell.
+        Here a child gets ``parent_total * (area of the child inside the parent) / (area of the parent)``: mass over missing cells is simply not allocated, and a fully
+        tiled parent is split exactly as before.
+
+        ``existing`` (child id, value) holds children that already have a value (native, or derived from a finer level). They keep it, and only the parent's
+        *residual* (its total minus what those children already carry) is split, over the area they do not already cover; so backfilling nulls can no longer count a
+        parent's mass twice.
+
+        Pure array arithmetic on integer codes (``np.bincount`` / ``cupy.bincount``): linear in the mapping rows, no per-group Python, and on the GPU when one is usable and
+        the mapping is large (see ``_backend``).
+        """
+        sid, did = self.id_cols[src], self.id_cols[dst]
+        pairs = mapping.select([did, sid, "_geoweight"])
+        c_codes, c_ids = pd.factorize(pairs[did].to_numpy())
+        p_codes, p_ids = pd.factorize(pairs[sid].to_numpy())
+        gw = pairs["_geoweight"].to_numpy().astype(np.float64)
+
+        gc, gp = self.geometries[dst], self.geometries[src]
+        child_area = pd.Series(gc["area"].to_numpy(), index=gc[did].to_numpy()).reindex(c_ids).to_numpy(dtype=np.float64)
+        par_area = pd.Series(gp["area"].to_numpy(), index=gp[sid].to_numpy()).reindex(p_ids).to_numpy(dtype=np.float64)
+        lv = self.levels[src]
+        par_total = pd.Series(lv[col].to_numpy(), index=lv[sid].to_numpy()).reindex(p_ids).to_numpy(dtype=np.float64)
+        has_child = np.zeros(len(c_ids), dtype=bool)
+        child_val = np.zeros(len(c_ids))
+        if existing is not None and len(existing):
+            ev = pd.Series(existing[col].to_numpy(), index=existing[did].to_numpy()).reindex(c_ids).to_numpy(dtype=np.float64)
+            has_child = np.isfinite(ev)
+            child_val = np.where(has_child, ev, 0.0)
+
+        xp = array_module(len(gw))
+        nc, npar = len(c_ids), len(p_ids)
+        c, p = xp.asarray(c_codes), xp.asarray(p_codes)
+        a = xp.asarray(gw) * xp.asarray(child_area)[c]                 # area of the child inside this parent
+        tot_a = xp.bincount(c, weights=a, minlength=nc)
+        frac = a / xp.where(tot_a[c] > 0, tot_a[c], 1.0)                # a child straddling parents splits its own mass by area
+        has = xp.asarray(has_child)[c]
+        have_mass = xp.bincount(p, weights=xp.where(has, xp.asarray(child_val)[c] * frac, 0.0), minlength=npar)
+        have_area = xp.bincount(p, weights=xp.where(has, a, 0.0), minlength=npar)
+        free_area = xp.bincount(p, weights=xp.where(has, 0.0, a), minlength=npar)
+        parea, total = xp.asarray(par_area), xp.asarray(par_total)
+        resid = xp.maximum(total - have_mass, 0.0)
+        left = parea - have_area
+        # (a free area within 0.5% of what is left of the parent counts as tiling it: area is not exactly additive, and a fully tiled parent must split exactly)
+        cap = xp.maximum(xp.where(free_area >= 0.995 * left, free_area, left), 1e-12)
+        ok = xp.isfinite(total) & xp.isfinite(parea)                   # a parent without a total or an area allocates nothing
+        share = xp.where(~has & ok[p], xp.nan_to_num(resid[p]) * a / cap[p], 0.0)
+        out = xp.bincount(c, weights=share, minlength=nc)
+        got = xp.bincount(c, weights=xp.where(~has & ok[p], 1.0, 0.0), minlength=nc) > 0   # children that received a share from at least one parent
+        out, got = to_numpy(out), to_numpy(got)
+        return pl.DataFrame({did: c_ids[got], col: out[got]})
 
     # ================================================================
     # NULL BACKFILL (NATIVE NULLS ONLY)
@@ -1058,6 +1145,18 @@ class GeoHierarchy:
                     intersection_mode=agg.intersection_mode,
                 )
         mapping = self._mapping_cache[cache_key]
+
+        if agg.mapping != "knn" and self._capacity_ok(agg, src, dst) and {col, self.id_cols[src]}.issubset(self.levels[src].columns):
+            existing = self.levels[dst].select([self.id_cols[dst], col]).drop_nulls(col)
+            cand = self._capacity_share(col, mapping, src, dst, existing=existing).rename({col: "_fill_candidate"})
+            return (
+                self.levels[dst]
+                .join(cand, on=self.id_cols[dst], how="left")
+                .with_columns(
+                    pl.coalesce([pl.col(col), pl.col("_fill_candidate")]).alias(col)
+                )
+                .drop("_fill_candidate")
+            )
 
         selected_cols = {col, self.id_cols[src]}
         if getattr(agg, "weight_column", None):

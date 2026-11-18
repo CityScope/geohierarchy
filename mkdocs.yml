@@ -1,0 +1,75 @@
+site_name: geohierarchy
+site_description: Hierarchical geospatial levels with automatic resampling
+docs_dir: docs
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - search.suggest
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            docstring_style: google
+            show_source: false
+            show_root_heading: false
+            members_order: source
+            filters: ["!^_"]
+            merge_init_into_class: true
+            show_if_no_docstring: false
+markdown_extensions:
+  - admonition
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.superfences
+  - pymdownx.highlight
+nav:
+  - Home: index.md
+  - "Guide": guide.md
+  - API reference:
+      - Overview: api/index.md
+      - aggregation: api/aggregation.md
+      - api_keys: api/api_keys.md
+      - chunked_h3_grid: api/chunked_h3_grid.md
+      - core: api/core.md
+      - edges: api/edges.md
+      - exceptions: api/exceptions.md
+      - geocoding: api/geocoding.md
+      - gpu_spatial: api/gpu_spatial.md
+      - h3_table: api/h3_table.md
+      - maps:
+          - Overview: api/maps/index.md
+          - basemap: api/maps/basemap.md
+          - folium:
+              - Overview: api/maps/folium/index.md
+              - basemap: api/maps/folium/basemap.md
+              - fast_tiles: api/maps/folium/fast_tiles.md
+              - h3_slow: api/maps/folium/h3_slow.md
+              - legend: api/maps/folium/legend.md
+              - maplibre_basemap: api/maps/folium/maplibre_basemap.md
+              - maplibre_render: api/maps/folium/maplibre_render.md
+              - pmtiles_render: api/maps/folium/pmtiles_render.md
+              - pmtiles_to_xyz: api/maps/folium/pmtiles_to_xyz.md
+              - render: api/maps/folium/render.md
+              - resolution: api/maps/folium/resolution.md
+              - style: api/maps/folium/style.md
+              - tiles: api/maps/folium/tiles.md
+              - tiles_slow: api/maps/folium/tiles_slow.md
+          - general_map: api/maps/general_map.md
+          - layers:
+              - Overview: api/maps/layers/index.md
+              - registry: api/maps/layers/registry.md
+          - maplibre:
+              - Overview: api/maps/maplibre/index.md
+              - pmtiles_meta: api/maps/maplibre/pmtiles_meta.md
+              - render: api/maps/maplibre/render.md
+      - naming: api/naming.md
+      - raster_resample: api/raster_resample.md
+      - spatial_cache: api/spatial_cache.md
+      - utils: api/utils.md

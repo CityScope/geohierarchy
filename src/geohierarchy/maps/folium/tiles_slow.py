@@ -44,6 +44,11 @@ def prep_level_gdf(
     Returns:
         ``(work, keep_cols)`` -- the reprojected/trimmed GeoDataFrame and
         the property columns kept in it (besides ``geometry``).
+
+    Args:
+        gdf: The level's geometries.
+        id_col: Id column kept on every feature.
+        property_cols: Other columns kept on the features.
     """
     if gdf.crs is not None and gdf.crs.to_epsg() != 4326:
         gdf = gdf.to_crs(4326)
@@ -72,7 +77,19 @@ def write_level_zoom_tiles(
 ) -> List[Path]:
     """Tile one level's already-prepped geometry (`prep_level_gdf`) at a
     single zoom `z`. The per-(level, zoom) parallel unit `HierarchyMap.build`
-    submits to its process pool."""
+    submits to its process pool.
+
+    Args:
+        work: Geometries prepared by :func:`prep_level_gdf`.
+        level_name: Name of the level (tile sub-folder).
+        tiles_dir: Root folder of the tiles.
+        z: Zoom level to write.
+        keep_cols: Columns written on each feature.
+        buffer_frac: Tile buffer as a fraction of the tile size.
+
+    Returns:
+        Paths of the written tiles.
+    """
     if work.empty:
         return []
 

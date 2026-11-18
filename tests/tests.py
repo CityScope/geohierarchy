@@ -393,7 +393,7 @@ def test_downscale_sum_splits_by_area(region_gdf, city_gdf):
     gh.propagate()
 
     vals = gh.levels["city"]["val"].to_list()
-    assert vals == pytest.approx([50.0, 50.0])
+    assert vals == pytest.approx([50.0, 50.0], rel=2e-3)   # area is not exactly additive
 
 
 def test_downscale_mean_broadcasts(region_gdf, city_gdf):
@@ -454,8 +454,9 @@ def test_null_native_backfilled_from_parent_leaves_real_values_untouched(
     assert gh.levels["region"]["population"][0] == 999.0
     # city B's real value must survive untouched.
     assert gh.levels["city"]["population"][1] == 999.0
-    # city A's null must be backfilled (region's total split across both matched cities), not left null.
-    assert gh.levels["city"]["population"][0] == pytest.approx(499.5)
+    # city A's null is backfilled from the region's RESIDUAL (its total minus what city B already carries): here nothing is left, so 0 -- the region's mass is
+    # not counted twice (it used to give A 499.5, inflating the region to 1498.5).
+    assert gh.levels["city"]["population"][0] == pytest.approx(0.0, abs=1.0)
 
 
 def test_null_backfill_cascades_through_multiple_levels(region_gdf, city_gdf, hood_gdf):
@@ -477,10 +478,11 @@ def test_null_backfill_cascades_through_multiple_levels(region_gdf, city_gdf, ho
     gh.set_aggregation("population", Sum())
 
     # both cities were entirely null, so both get an equal share of the region.
-    assert gh.levels["city"]["population"].to_list() == [500.0, 500.0]
+    assert gh.levels["city"]["population"].to_list() == pytest.approx([500.0, 500.0], rel=2e-3)
     # hood n1 (under city A) had no value of its own, so it's backfilled from
     # city A's now-filled value; hoods n2-n4's real values are untouched.
-    assert gh.levels["hood"]["population"].to_list() == [250.0, 5.0, 6.0, 7.0]
+    # (the residual of city A: 500 minus the 5 that hood n2 already carries)
+    assert gh.levels["hood"]["population"].to_list() == pytest.approx([495.0, 5.0, 6.0, 7.0], rel=5e-3)
 
 
 def test_null_backfill_uses_broadcast_for_strategies_with_no_proportional_downscale(
@@ -1005,10 +1007,10 @@ def test_smoothmean_vs_overlap_downscale_at_the_same_boundary(
     hard.add_level("fine", between_fine_gdf, id_col="fid", parent="coarse")
     hard_values = hard.levels["fine"].sort("fid")["value"].to_list()
 
-    # Sum's proportional split reproduces the source boundary exactly: L's
-    # total splits only across its own 5 overlapping cells, R's only across
-    # its own -- a hard step at the boundary, cells only ever see one side.
-    assert hard_values == pytest.approx([20.0] * 5 + [0.0] * 5)
+    # Sum's split reproduces the source boundary exactly: L's mass goes only to
+    # its own 5 overlapping cells, R's only to its own -- a hard step at the boundary.
+    # (the 5 cells cover half of L's area, so they carry half of its total: the rest belongs to ground the grid does not cover)
+    assert hard_values == pytest.approx([10.0] * 5 + [0.0] * 5, rel=1e-2)
 
     smooth = GeoHierarchy()
     smooth.add_level("coarse", two_source_gdf, id_col="id", agg=SmoothMean(k=2))
@@ -1248,3 +1250,32 @@ def test_count_column_total_is_forced_to_match_even_when_blend_alone_would_drift
     gh.add_level("fine", fine, id_col="fid", parent="coarse")
 
     assert gh.levels["fine"]["jobs"].sum() == pytest.approx(450.0, rel=0.01)
+
+
+# ============================================================
+# CAPACITY SPLIT: a grid that covers only part of its parent must not pile the parent's mass onto the cells present
+# ============================================================
+
+
+def test_downscale_sum_over_partly_covered_parent_does_not_pile_up():
+    """One 1000-person parent (area 100), only one 10-area cell exists inside it: that cell gets 10% of the total, not all of it."""
+    parent = gpd.GeoDataFrame({"pid": ["P"], "pop": [1000.0]}, geometry=[box(0, 0, 10, 10)], crs="EPSG:4326")
+    cell = gpd.GeoDataFrame({"cid": ["c"]}, geometry=[box(0, 0, 1, 10)], crs="EPSG:4326")
+    gh = GeoHierarchy()
+    gh.add_level("parent", parent, id_col="pid")
+    gh.add_level("cell", cell, id_col="cid", parent="parent")
+    gh.set_aggregation("pop", Sum(geoweighted=True))
+    assert gh.levels["cell"]["pop"][0] == pytest.approx(100.0, rel=2e-2)
+
+
+def test_backfill_gives_nulls_only_the_residual_over_the_uncovered_area():
+    """Parent total 1000, one cell already carries 600; a null cell covering a tenth of the parent gets a tenth of the residual 400 (not of 1000)."""
+    parent = gpd.GeoDataFrame({"pid": ["P"], "pop": [1000.0]}, geometry=[box(0, 0, 10, 10)], crs="EPSG:4326")
+    cells = gpd.GeoDataFrame({"cid": ["a", "b"], "pop": [600.0, None]}, geometry=[box(0, 0, 5, 10), box(5, 0, 6, 10)], crs="EPSG:4326")
+    gh = GeoHierarchy()
+    gh.add_level("parent", parent, id_col="pid")
+    gh.add_level("cell", cells, id_col="cid", parent="parent")
+    gh.set_aggregation("pop", Sum(geoweighted=True))
+    got = gh.levels["cell"].sort("cid")["pop"].to_list()
+    assert got[0] == 600.0
+    assert got[1] == pytest.approx(400.0 * 10 / 50, rel=3e-2)   # residual 400 over the 50 area still uncovered; the null cell is 10 of it

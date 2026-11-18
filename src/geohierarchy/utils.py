@@ -3,6 +3,7 @@
 import polars as pl
 import geopandas as gpd
 import numpy as np
+import pandas as pd
 import rasterio as rio
 from typing import Optional, Literal
 from pyproj import Geod
@@ -10,6 +11,15 @@ import warnings
 
 
 def geodesic_area(geom, geod=Geod(ellps="WGS84")) -> float:
+    """Area of a polygon or multipolygon on the ellipsoid, in m2 (0 for other geometry types or an empty geometry).
+
+    Args:
+        geom: Shapely geometry in EPSG:4326.
+        geod: The ellipsoid (pyproj ``Geod``).
+
+    Returns:
+        Area in square metres.
+    """
     if geom is None or geom.is_empty:
         return 0.0
 
@@ -25,6 +35,15 @@ def geodesic_area(geom, geod=Geod(ellps="WGS84")) -> float:
 
 
 def geodesic_perimeter(geom, geod=Geod(ellps="WGS84")) -> float:
+    """Perimeter of a polygon or multipolygon on the ellipsoid, in m (0 for other geometry types).
+
+    Args:
+        geom: Shapely geometry in EPSG:4326.
+        geod: The ellipsoid (pyproj ``Geod``).
+
+    Returns:
+        Perimeter in metres.
+    """
     if geom is None or geom.is_empty:
         return 0.0
 
@@ -40,6 +59,15 @@ def geodesic_perimeter(geom, geod=Geod(ellps="WGS84")) -> float:
 
 
 def geodesic_length(geom, geod=Geod(ellps="WGS84")) -> float:
+    """Length of a line or multiline on the ellipsoid, in m; for polygons, their perimeter.
+
+    Args:
+        geom: Shapely geometry in EPSG:4326.
+        geod: The ellipsoid (pyproj ``Geod``).
+
+    Returns:
+        Length in metres.
+    """
     if geom is None or geom.is_empty:
         return 0.0
 
@@ -63,6 +91,18 @@ def is_utm_reasonable(
     """
     Check if a GeoDataFrame is reasonable for a single UTM projection.
     Uses the CRS ellipsoid directly.
+
+    Args:
+        gdf: Data in a geographic CRS (degrees).
+        max_width_m: Largest east-west extent that one UTM zone handles well.
+        max_height_m: Largest north-south extent that one UTM zone handles well.
+        ellps: Ellipsoid name; ``None`` = the CRS's own.
+
+    Returns:
+        True if the data's extent fits one UTM projection.
+
+    Raises:
+        ValueError: If the data have no geographic CRS.
     """
     if gdf.crs is None or not gdf.crs.is_geographic:
         raise ValueError("GeoDataFrame must have geographic CRS (degrees).")
@@ -189,6 +229,17 @@ def length(
 
 
 def get_geometry_types(gdf):
+    """The base geometry types present (``Multi*`` counted as its single type), e.g. ``{"Polygon", "Point"}``.
+
+    Args:
+        gdf: A non-empty GeoDataFrame.
+
+    Returns:
+        Set of base geometry type names.
+
+    Raises:
+        ValueError: If the GeoDataFrame is empty or None.
+    """
     if gdf is None or gdf.empty:
         raise ValueError("GeoDataFrame is empty or None")
 
@@ -235,6 +286,38 @@ def vectorize_raster_polars(
             "maxy": lat + dy / 2,
         }
     ).filter(pl.col("value").is_not_null())
+
+
+def _exact_area_mapping(src: gpd.GeoDataFrame, dst: gpd.GeoDataFrame, src_id: str, dst_id: str) -> "pd.DataFrame":
+    """`[src_id, dst_id, _geoweight]` with `_geoweight` = area of (src row inside dst row) / area of the src row, like ``gpd.overlay(...)`` but without the overlay.
+
+    ``gpd.overlay`` clips every candidate pair. Almost every pair is a src polygon (a hexagon, a block) lying entirely inside one dst polygon (a district, a county) and weighs
+    exactly 1, so only the pairs that really straddle a border need a clip: a bounding-box STRtree query finds the candidates, one vectorised prepared-geometry ``contains`` settles the
+    contained ones, and ``shapely.intersection`` runs on the rest. Typically an order of magnitude faster, with the same weights (same area function, same pairs)."""
+    import shapely
+
+    s_geoms = src.geometry.to_numpy()
+    d_geoms = dst.geometry.to_numpy()
+    tree = shapely.STRtree(d_geoms)
+    si, di = tree.query(s_geoms)                       # bounding-box candidates only (microseconds); the exact predicates below run on PREPARED geometries
+    if len(si) == 0:
+        return pd.DataFrame({src_id: [], dst_id: [], "_geoweight": []})
+    shapely.prepare(d_geoms)
+    contained = shapely.contains(d_geoms[di], s_geoms[si])
+    maybe = np.flatnonzero(~contained)
+    if len(maybe):
+        hit = shapely.intersects(d_geoms[di[maybe]], s_geoms[si[maybe]])
+        keep = np.ones(len(si), dtype=bool)
+        keep[maybe[~hit]] = False                       # bbox neighbours that do not really touch the polygon
+        si, di, contained = si[keep], di[keep], contained[keep]
+    w = np.ones(len(si))
+    part = np.flatnonzero(~contained)
+    if len(part):
+        inter = shapely.intersection(s_geoms[si[part]], d_geoms[di[part]])
+        a_int = area(gpd.GeoSeries(inter, crs=src.crs), point_area=0, line_area=0)
+        a_src = src["area"].to_numpy()[si[part]]
+        w[part] = np.where(a_src > 0, np.asarray(a_int) / np.where(a_src > 0, a_src, 1.0), 0.0)
+    return pd.DataFrame({src_id: src[src_id].to_numpy()[si], dst_id: dst[dst_id].to_numpy()[di], "_geoweight": w})
 
 
 def get_id_mapping(
@@ -372,6 +455,11 @@ def get_id_mapping(
             else:
                 src["length"] = length(src.geometry, point_length=0)
 
+        if how == "area" and bool((src.geometry.geom_type.isin(["Polygon", "MultiPolygon"])).all()) and bool((dst.geometry.geom_type.isin(["Polygon", "MultiPolygon"])).all()):
+            try:
+                return pl.from_pandas(_exact_area_mapping(src, dst, src_id, dst_id))
+            except Exception:  # noqa: BLE001 -- never worse than before: fall back to the overlay
+                pass
         inter = gpd.overlay(src, dst, how="intersection", keep_geom_type=False)
         if how == "area":
             inter["_geoweight"] = np.where(

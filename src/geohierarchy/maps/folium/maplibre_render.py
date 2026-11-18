@@ -46,6 +46,25 @@ def generate_maplibre_html(
     extra_css: Optional[str] = None,
     extra_js: Optional[str] = None,
 ) -> Path:
+    """Write a standalone MapLibre GL JS page from ready-made sources and layers.
+
+    Args:
+        output_path: HTML file to write (parent folders are created).
+        sources: MapLibre sources ``{id: source spec}``; a raster basemap source is added.
+        layers: MapLibre layer specs, drawn above the basemap in order.
+        basemap: Basemap name (see the basemap table of this module) or a custom spec.
+        center: ``(lon, lat)`` of the initial view; ``None`` lets the page fit the data.
+        zoom: Initial zoom.
+        title: Page title.
+        include_h3j_h3t: Load the H3 JSON / H3 tile protocol scripts.
+        include_pmtiles: Load the PMTiles protocol script.
+        legend_html: Optional HTML placed as the legend.
+        extra_css: Optional CSS added to the page.
+        extra_js: Optional JavaScript run after the map loads.
+
+    Returns:
+        Path of the written HTML file.
+    """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -152,6 +171,24 @@ def generate_mixed_html(
     title: str = "Map",
     **kwargs: Any,
 ) -> Path:
+    """Write a MapLibre page mixing PMTiles archives, H3 JSON files and H3 tile folders, one layer each.
+
+    Args:
+        pmtiles_paths: ``{layer name: .pmtiles file}``.
+        h3j_paths: ``{layer name: H3 JSON file}``.
+        h3t_dirs: ``{layer name: H3 tile folder}``.
+        output_path: HTML file to write.
+        layer_styles: Optional ``{layer name: paint / layout overrides}``.
+        zoom_ranges: Optional ``{layer name: (min zoom, max zoom)}``.
+        basemap: Basemap name or spec.
+        center: ``(lon, lat)`` of the initial view.
+        zoom: Initial zoom.
+        title: Page title.
+        kwargs: Passed on to :func:`generate_maplibre_html`.
+
+    Returns:
+        Path of the written HTML file.
+    """
     all_sources = {}
     all_layers = []
     extra_js_parts = []

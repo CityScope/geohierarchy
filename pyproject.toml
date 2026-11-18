@@ -27,6 +27,9 @@ dependencies = [
     "freestiler>=0.2.0",
     "pmtiles>=3.7.0",
     "tqdm>=4.67.1",
+    "matplotlib>=3.8.0",   # geohierarchy.maps.general_map
+    "pycountry>=24.6.1",   # geohierarchy.geocoding
+    "requests>=2.31.0",    # geohierarchy.geocoding
 ]
 
 [build-system]
@@ -48,3 +51,11 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[project.optional-dependencies]
+# GPU is OPTIONAL: nothing here is installed by default and every code path falls back to the CPU when CuPy / a CUDA device is missing (TRANSITLOS_DEVICE=cpu forces it).
+gpu = ["cupy-cuda12x>=13.0"]
+# RAPIDS (cuDF / cuGraph) is big and pins its own dependency versions: install it in a SEPARATE environment, e.g.
+#   python -m venv .venv-rapids && .venv-rapids/bin/pip install cudf-cu12 cugraph-cu12 --extra-index-url=https://pypi.nvidia.com
+# and point TRANSITLOS_RAPIDS_PYTHON at that environment's python; the pipeline calls it in a subprocess only when it exists.
+rapids = ["cudf-cu12", "cugraph-cu12"]

@@ -1,4 +1,4 @@
-# geohierarchy
+# Guide
 
 `geohierarchy` manages a **graph of spatial levels** (e.g. county → tract →
 block group → block, or any other set of nested or overlapping geometries)
@@ -220,7 +220,7 @@ A `GeoHierarchy` is a graph of spatial levels (county → tract → block) that
 automatically fills in shared columns everywhere, using the right spatial
 resampling in each direction. `propagate()` runs **automatically** after
 `add_level`, `add_vector_data`, `add_raster_data`, and `set_aggregation` --
-you never have to call it yourself. See `docs.md` for the full reference.
+you never have to call it yourself. See the API reference (`mkdocs serve`) for the full reference.
 
 
 ### 1. Load some nested geographies

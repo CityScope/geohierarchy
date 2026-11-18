@@ -42,6 +42,14 @@ def partition_h3_table(
     Exact, non-overlapping, non-duplicating partition (see module docstring)
     -- every row of `df` appears in exactly one output value, under its own
     tile id key.
+
+    Args:
+        df: Table with one H3 cell id per row.
+        tile_resolution: H3 resolution of the tiles (coarser than the cells).
+        h3_col: Column holding the H3 cell ids.
+
+    Returns:
+        ``{tile id: rows of df inside that tile}``; empty for an empty table.
     """
     import h3
 
@@ -65,13 +73,10 @@ def _tile_worker(table_bytes: bytes, tile_id: str, h3_col: str, output_dir: str)
     """
     import io
 
-    # Local import so this also works when `UrbanAccessAnalyzer` isn't a hard
-    # dependency of every `geohierarchy` install -- only needed inside the
-    # worker, only when this chunked path is actually used.
-    from UrbanAccessAnalyzer import h3_ops
+    from .h3_table import to_gdf
 
     table = pl.read_ipc(io.BytesIO(table_bytes))
-    gdf = h3_ops.to_gdf(table, h3_column=h3_col)
+    gdf = to_gdf(table, h3_column=h3_col)
     out_path = str(Path(output_dir) / f"tile_{tile_id}.parquet")
     gdf.to_parquet(out_path)
     return out_path

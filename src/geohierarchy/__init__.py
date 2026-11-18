@@ -12,7 +12,7 @@ from .aggregation import (
 )
 from .exceptions import ColumnNotFoundError, AggregationStrategyError
 from .utils import h3_cells, get_knn_mapping, get_id_mapping
-from .edges import edges_to_level, edges_to_h3_by_distance
+from .edges import edges_to_level, edges_to_h3_by_distance, h3_cells_near_lines
 from .raster_resample import raster_to_polygons, raster_to_h3
 from .spatial_cache import (
     build_raster_h3_mapping,

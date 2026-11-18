@@ -40,7 +40,7 @@ gh.add_vector_data(streets_gdf, level="tract", agg=Mean(weight_column="populatio
 gh["tract"]   # GeoDataFrame: geometry + every column, filled in at every level -- no propagate() call needed
 ```
 
-See [`docs.md`](docs.md) for the full concept guide and API reference
+See [`docs/guide.md`](docs/guide.md) for the full concept guide and API reference
 (levels, aggregation strategies, H3/raster ingestion, non-layer data, and
 more), and [`examples/geohierarchy_walkthrough.ipynb`](examples/geohierarchy_walkthrough.ipynb)
 for a worked, narrated example.
@@ -67,4 +67,24 @@ pre-commit install
 ```
 
 `pre-commit` runs `ruff` (lint + format) and basic hygiene checks
-(trailing whitespace, large-file guard) on every commit.
+(trailing whitespace, large-file check: see "Large files" below) on every commit.
+
+## Use as a library
+
+geohierarchy has no implicit cache location: the id-mapping cache functions in `geohierarchy.spatial_cache`
+(`load_mapping`, `save_mapping`, `get_id_mapping`, ...) take an explicit `cache_dir`, and nothing is written to the
+current working directory otherwise. Pass a persistent folder to reuse mappings across runs:
+
+```python
+from geohierarchy.spatial_cache import get_id_mapping
+mapping = get_id_mapping(..., cache_dir="/data/my_project/cache/geohierarchy")
+```
+
+## Large files
+
+A pre-commit hook (`tools/check_large_files.py`, installed with `python3 tools/check_large_files.py --install`) refuses a commit with a file over 10 MB once: run the same commit again to keep it. Files over 50 MB are never committed.
+
+## Local files
+
+This repository is public. API keys (`api_keys.json`, `.env`), notes about a particular machine or its processes (hosting, uploads,
+local paths) and upload scripts are never committed: keep notes as `*.local.md` or under `local/`, which `.gitignore` excludes.

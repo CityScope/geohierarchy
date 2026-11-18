@@ -35,6 +35,18 @@ def _valid(v: pl.Expr, w: pl.Expr | None = None) -> pl.Expr:
 
 
 def sum_agg(column_name, weight_column=None, geoweighted=False):
+    """Group-by expression for a (weighted) sum: ``sum(value * weight)`` over the valid rows.
+
+    Rows whose value (or weight) is null or NaN are ignored; a group with no valid row gives null, not 0.
+
+    Args:
+        column_name: Column to aggregate.
+        weight_column: Optional column whose values weight each row.
+        geoweighted: Whether to also weight each row by its geometric overlap fraction (the ``"_geoweight"`` column).
+
+    Returns:
+        A Polars aggregation expression named ``column_name``.
+    """
     if weight_column is None:
         w = pl.lit(1)
     else:
@@ -81,6 +93,17 @@ def sum_agg(column_name, weight_column=None, geoweighted=False):
 
 
 def sum_expr(column_name, group_col, weight_column=None, geoweighted=False):
+    """Window version of :func:`sum_agg`: the group's (weighted) sum broadcast to each of its rows.
+
+    Args:
+        column_name: Column to aggregate.
+        weight_column: Optional column whose values weight each row.
+        geoweighted: Whether to also weight each row by its geometric overlap fraction (the ``"_geoweight"`` column).
+        group_col: Column identifying the group of each row.
+
+    Returns:
+        A Polars expression named ``column_name``.
+    """
     if weight_column is None:
         w = pl.lit(1)
     else:
@@ -113,6 +136,16 @@ def sum_expr(column_name, group_col, weight_column=None, geoweighted=False):
 
 
 def mean_agg(column_name, weight_column=None, geoweighted=False):
+    """Group-by expression for a (weighted) mean: ``sum(value * weight) / sum(weight)`` over the valid rows.
+
+    Args:
+        column_name: Column to aggregate.
+        weight_column: Optional column whose values weight each row.
+        geoweighted: Whether to also weight each row by its geometric overlap fraction (the ``"_geoweight"`` column).
+
+    Returns:
+        A Polars aggregation expression named ``column_name`` (null when no row is valid).
+    """
     if weight_column is None:
         w = pl.lit(1)
     else:
@@ -139,6 +172,17 @@ def mean_agg(column_name, weight_column=None, geoweighted=False):
 
 
 def mean_expr(column_name, group_col, weight_column=None, geoweighted=False):
+    """Window version of :func:`mean_agg`: the group's (weighted) mean broadcast to each of its rows.
+
+    Args:
+        column_name: Column to aggregate.
+        weight_column: Optional column whose values weight each row.
+        geoweighted: Whether to also weight each row by its geometric overlap fraction (the ``"_geoweight"`` column).
+        group_col: Column identifying the group of each row.
+
+    Returns:
+        A Polars expression named ``column_name``.
+    """
     if weight_column is None:
         w = pl.lit(1)
     else:
@@ -165,6 +209,19 @@ def mean_expr(column_name, group_col, weight_column=None, geoweighted=False):
 
 
 def divide_expr(column_name, group_col, weight_column=None, geoweighted=False):
+    """Split a group's total across its rows in proportion to their weights: ``value * weight / sum(weight)``.
+
+    Used to downscale additive columns: the shares of a group add back up to its total.
+
+    Args:
+        column_name: Column to aggregate.
+        weight_column: Optional column whose values weight each row.
+        geoweighted: Whether to also weight each row by its geometric overlap fraction (the ``"_geoweight"`` column).
+        group_col: Column identifying the source (coarse) row each destination row belongs to.
+
+    Returns:
+        A Polars expression named ``column_name`` (null when the group's weights sum to 0).
+    """
     if weight_column is None:
         w = pl.lit(1)
     else:
@@ -431,6 +488,14 @@ class Sum(AggregationStrategy):
         self.weight_column = weight_column
 
     def upscale_aggs(self, columns: List[str]) -> List[pl.Expr]:
+        """Weighted sum of each column (see :func:`sum_agg`).
+
+        Args:
+            columns: Column names to aggregate.
+
+        Returns:
+            One Polars aggregation expression per column.
+        """
         exprs = []
         for c in columns:
             exprs.append(sum_agg(c, self.weight_column, self.geoweighted))
@@ -438,6 +503,15 @@ class Sum(AggregationStrategy):
         return exprs
 
     def downscale_exprs(self, columns: List[str], group_col: str) -> List[pl.Expr]:
+        """Proportional share of the coarse total for each row (see :func:`divide_expr`).
+
+        Args:
+            columns: Column names to build expressions for.
+            group_col: Column identifying the source (coarse) row of each destination row.
+
+        Returns:
+            One Polars expression per column.
+        """
         exprs = []
         for c in columns:
             exprs.append(
@@ -447,6 +521,14 @@ class Sum(AggregationStrategy):
         return exprs
 
     def consolidate_downscale(self, columns: List[str]) -> List[pl.Expr]:
+        """Add the fragments of a destination row: the shares sum back to the source totals.
+
+        Args:
+            columns: Column names to consolidate.
+
+        Returns:
+            One Polars aggregation expression per column.
+        """
         # Proportional shares are built to sum back to the original total,
         # so a destination row split across multiple sources adds its
         # fragments together rather than keeping just one.
@@ -488,6 +570,14 @@ class Mean(AggregationStrategy):
         self.weight_column = weight_column
 
     def upscale_aggs(self, columns: List[str]) -> List[pl.Expr]:
+        """Weighted mean of each column (see :func:`mean_agg`).
+
+        Args:
+            columns: Column names to aggregate.
+
+        Returns:
+            One Polars aggregation expression per column.
+        """
         exprs = []
 
         for c in columns:
@@ -496,6 +586,15 @@ class Mean(AggregationStrategy):
         return exprs
 
     def downscale_exprs(self, columns: List[str], group_col: str) -> List[pl.Expr]:
+        """The coarse weighted mean broadcast to each row (see :func:`mean_expr`); empty when the strategy is unweighted.
+
+        Args:
+            columns: Column names to build expressions for.
+            group_col: Column identifying the source (coarse) row of each destination row.
+
+        Returns:
+            One Polars expression per column.
+        """
         exprs = []
         for c in columns:
             if self.geoweighted or (self.weight_column is not None):
@@ -578,9 +677,26 @@ class SmoothMean(AggregationStrategy):
         self.density = density
 
     def upscale_aggs(self, columns: List[str]) -> List[pl.Expr]:
+        """Plain unweighted mean of each column.
+
+        Args:
+            columns: Column names to aggregate.
+
+        Returns:
+            One Polars aggregation expression per column.
+        """
         return [pl.col(c).fill_nan(None).mean().alias(c) for c in columns]
 
     def downscale_exprs(self, columns: List[str], group_col: str) -> List[pl.Expr]:
+        """Nothing per row: the blend happens in :meth:`consolidate_downscale`.
+
+        Args:
+            columns: Column names to build expressions for.
+            group_col: Column identifying the source (coarse) row of each destination row.
+
+        Returns:
+            One Polars expression per column (always empty).
+        """
         # The actual blend happens in consolidate_downscale, which needs
         # the raw value, "_geoweight", and (if density=True) the area
         # columns from get_knn_mapping -- so there is nothing to
@@ -588,6 +704,14 @@ class SmoothMean(AggregationStrategy):
         return []
 
     def consolidate_downscale(self, columns: List[str]) -> List[pl.Expr]:
+        """Inverse-distance blend of the k nearest source values (in density space if ``density``); null when every neighbour is null.
+
+        Args:
+            columns: Column names to consolidate.
+
+        Returns:
+            One Polars aggregation expression per column.
+        """
         # Null neighbors are ignored and the remaining weights renormalized
         # (mirroring mean_agg/mean_expr's null handling elsewhere in this
         # module), so a destination cell with at least one non-null
@@ -622,12 +746,37 @@ class Max(AggregationStrategy):
     """Take the maximum value across source rows; has no downscale behavior."""
 
     def upscale_aggs(self, columns: List[str]) -> List[pl.Expr]:
+        """Maximum of each column.
+
+        Args:
+            columns: Column names to aggregate.
+
+        Returns:
+            One Polars aggregation expression per column.
+        """
         return [pl.col(c).fill_nan(None).max().alias(c) for c in columns]
 
     def downscale_exprs(self, columns: List[str], group_col: str) -> List[pl.Expr]:
+        """No downscale for a maximum.
+
+        Args:
+            columns: Column names to build expressions for.
+            group_col: Column identifying the source (coarse) row of each destination row.
+
+        Returns:
+            One Polars expression per column (always empty).
+        """
         return []
 
     def consolidate_downscale(self, columns: List[str]) -> List[pl.Expr]:
+        """Maximum of the fragments of a destination row.
+
+        Args:
+            columns: Column names to consolidate.
+
+        Returns:
+            One Polars aggregation expression per column.
+        """
         return [pl.col(c).max().alias(c) for c in columns]
 
 
@@ -640,10 +789,35 @@ class Min(AggregationStrategy):
     """Take the minimum value across source rows; has no downscale behavior."""
 
     def upscale_aggs(self, columns: List[str]) -> List[pl.Expr]:
+        """Minimum of each column.
+
+        Args:
+            columns: Column names to aggregate.
+
+        Returns:
+            One Polars aggregation expression per column.
+        """
         return [pl.col(c).fill_nan(None).min().alias(c) for c in columns]
 
     def downscale_exprs(self, columns: List[str], group_col: str) -> List[pl.Expr]:
+        """No downscale for a minimum.
+
+        Args:
+            columns: Column names to build expressions for.
+            group_col: Column identifying the source (coarse) row of each destination row.
+
+        Returns:
+            One Polars expression per column (always empty).
+        """
         return []
 
     def consolidate_downscale(self, columns: List[str]) -> List[pl.Expr]:
+        """Minimum of the fragments of a destination row.
+
+        Args:
+            columns: Column names to consolidate.
+
+        Returns:
+            One Polars aggregation expression per column.
+        """
         return [pl.col(c).min().alias(c) for c in columns]

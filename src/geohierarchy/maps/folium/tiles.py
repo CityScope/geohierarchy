@@ -96,6 +96,14 @@ def prep_level_gdf(
 
     This is kept for backward compatibility with the old API.
     For new code, use Polars DataFrames directly with generate_pmtiles_from_polars().
+
+    Args:
+        gdf: The level's geometries.
+        id_col: Id column kept on every feature.
+        property_cols: Other columns kept on the features.
+
+    Returns:
+        ``(gdf in EPSG:4326 with only the kept columns, list of kept columns)``.
     """
     if gdf.crs is not None and gdf.crs.to_epsg() != 4326:
         gdf = gdf.to_crs(4326)
@@ -187,6 +195,23 @@ def _adaptive_h3_chunk_keys(
     return keys
 
 
+def _die_with_parent() -> None:
+    """Pool initializer: on Linux the worker gets SIGTERM when its parent dies, so a killed build never leaves tilers running (and holding memory)."""
+    try:
+        import ctypes
+        import signal
+
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM)   # PR_SET_PDEATHSIG = 1
+    except Exception:  # noqa: BLE001 -- not Linux: nothing to do
+        pass
+
+
+def _tile_chunk(src: str, dst: str, level_name: str, min_zoom: int, max_zoom: int) -> str:
+    """One chunk's parquet -> pmtiles (module level so it can run in a worker process)."""
+    generate_pmtiles_from_geoparquet(Path(src), Path(dst), layer_name=level_name, min_zoom=min_zoom, max_zoom=max_zoom, quiet=True)
+    return dst
+
+
 def _write_level_tiles_chunked(
     gdf: gpd.GeoDataFrame,
     level_name: str,
@@ -242,27 +267,31 @@ def _write_level_tiles_chunked(
     gdf = gdf.reset_index(drop=True)
     chunk_keys = chunk_keys.reset_index(drop=True)
 
-    pmtiles_paths: List[Path] = []
-    for chunk_key, idx in chunk_keys.groupby(chunk_keys).groups.items():
-        chunk_gdf = gdf.iloc[list(idx)]
-        pmtiles_path = level_dir / f"chunk_{chunk_key}.pmtiles"
-        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp:
-            tmp_path = Path(tmp.name)
-        try:
-            chunk_gdf.to_parquet(tmp_path)
-            del chunk_gdf
-            gc.collect()
-            generate_pmtiles_from_geoparquet(
-                tmp_path,
-                pmtiles_path,
-                layer_name=level_name,
-                min_zoom=min_zoom,
-                max_zoom=max_zoom,
-                quiet=True,
-            )
-        finally:
-            tmp_path.unlink(missing_ok=True)
-        pmtiles_paths.append(pmtiles_path)
+    # Each chunk's rows go to a parquet file first (sequential, fast); the chunks are then tiled in a pool of worker processes
+    # (GEOHIERARCHY_TILE_WORKERS, default cpu_count - 2 up to 12; 1 = one after another). Thousands of chunks (nationwide voting districts) took
+    # half an hour one after another.
+    import os
+
+    jobs: List[tuple] = []
+    tmp_dir = Path(tempfile.mkdtemp(prefix=f"chunks_{level_name}_", dir=str(tiles_dir)))
+    try:
+        for chunk_key, idx in chunk_keys.groupby(chunk_keys).groups.items():
+            src = tmp_dir / f"{chunk_key}.parquet"
+            gdf.iloc[list(idx)].to_parquet(src)
+            jobs.append((str(src), str(level_dir / f"chunk_{chunk_key}.pmtiles"), level_name, int(min_zoom), int(max_zoom)))
+        workers = int(os.environ.get("GEOHIERARCHY_TILE_WORKERS", max(1, min((os.cpu_count() or 2) - 2, 12))))
+        if workers <= 1 or len(jobs) < 4:
+            for j in jobs:
+                _tile_chunk(*j)
+        else:
+            import multiprocessing as mp
+            from concurrent.futures import ProcessPoolExecutor
+
+            with ProcessPoolExecutor(workers, mp_context=mp.get_context("spawn"), initializer=_die_with_parent) as ex:
+                list(ex.map(_tile_chunk, *zip(*jobs), chunksize=max(1, len(jobs) // (workers * 8))))
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    pmtiles_paths: List[Path] = [Path(j[1]) for j in jobs]
 
     del gdf
     gc.collect()
@@ -493,6 +522,17 @@ def write_level_zoom_tiles(
 
     For backward compatibility with the old parallel processing API.
     In the fast implementation, we don't use this as we generate all zooms at once.
+
+    Args:
+        work: Geometries prepared by :func:`prep_level_gdf`.
+        level_name: Name of the level (tile sub-folder).
+        tiles_dir: Root folder of the tiles.
+        z: Zoom level to write.
+        keep_cols: Columns written on each feature.
+        buffer_frac: Tile buffer as a fraction of the tile size.
+
+    Returns:
+        Paths of the written tiles.
     """
     # This is a fallback for old code that calls this directly
     # The fast implementation generates all zooms in one call

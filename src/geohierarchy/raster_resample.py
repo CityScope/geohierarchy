@@ -621,6 +621,13 @@ def pixel_area_density_bounds(
     that polygon actually touches (see the test suite for the full,
     per-cell version of this check -- this module-level helper gives the
     raster-wide bound only).
+
+    Args:
+        raster_array: Raster values (NaN or nodata already masked).
+        transform: The raster's affine transform (pixel size from it).
+
+    Returns:
+        ``(min density, max density)`` over the valid pixels.
     """
     px_area = abs(transform.a * transform.e)
     valid = np.isfinite(raster_array)

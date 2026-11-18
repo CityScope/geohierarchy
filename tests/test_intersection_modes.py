@@ -145,18 +145,10 @@ def test_sum_downscale_conserves_total(overlapping_dst):
 
 
 def test_sum_downscale_splits_by_geoweight_not_just_weight_column():
-    # Regression test for a bug where `divide_expr` (the downscale half of
-    # `Sum`) computed its split ratio from `weight_column` alone, ignoring
-    # `_geoweight` even when `geoweighted=True` -- so "exact" downscaling
-    # into a child that only partially overlaps its parent still got the
-    # same split weight as a child fully inside it, even though upscaling
-    # (`sum_agg`) correctly discounted partial overlaps via `_geoweight`.
-    #
-    # D is the sole parent. C1 sticks half out of D (only half its own area
-    # overlaps D -> _geoweight=0.5); C2 sits entirely inside D
-    # (_geoweight=1.0). With no `weight_column`, a bug that ignores
-    # `_geoweight` would split D's value 50/50 regardless; the correct,
-    # area-weighted split is C1 : C2 = 0.5 : 1.0 -> 1/3 : 2/3.
+    # Regression test for a bug where `divide_expr` (the downscale half of `Sum`) split by `weight_column` alone, ignoring
+    # `_geoweight` with `geoweighted=True`. D is the sole parent (area 1, value 90). C1 covers 0.25 of D (and sticks out of
+    # it), C2 covers 0.75: the parent's value is spread by the area each child covers inside it -> 22.5 and 67.5. A split
+    # that ignores the overlap would give 45 / 45.
     dst = gpd.GeoDataFrame(
         {"dst_id": ["D"], "population": [90], "geometry": [box(0, 0, 1, 1)]},
         crs="EPSG:4326",
@@ -165,8 +157,8 @@ def test_sum_downscale_splits_by_geoweight_not_just_weight_column():
         {
             "src_id": ["C1", "C2"],
             "geometry": [
-                box(-0.5, 0.0, 0.5, 1.0),  # area 1.0, half (0.5) overlaps D
-                box(0.5, 0.0, 1.0, 1.0),  # area 0.5, fully inside D
+                box(-0.5, 0.0, 0.25, 1.0),  # covers 0.25 of D (0.5 of it lies outside D)
+                box(0.25, 0.0, 1.0, 1.0),  # covers 0.75 of D, fully inside it
             ],
         },
         crs="EPSG:4326",
@@ -181,8 +173,7 @@ def test_sum_downscale_splits_by_geoweight_not_just_weight_column():
 
     result = gh.get_level("src")
     values = dict(zip(result["src_id"].tolist(), result["population"].tolist()))
-    # eff_w: C1=0.5, C2=1.0, sum=1.5 -> C1 = 90 * 0.5/1.5 = 30, C2 = 90 * 1.0/1.5 = 60.
-    assert values["C1"] == pytest.approx(30.0, rel=1e-3)
-    assert values["C2"] == pytest.approx(60.0, rel=1e-3)
+    assert values["C1"] == pytest.approx(22.5, rel=1e-3)
+    assert values["C2"] == pytest.approx(67.5, rel=1e-3)
     # And the split still conserves the parent's total.
     assert (values["C1"] + values["C2"]) == pytest.approx(90.0, rel=1e-3)

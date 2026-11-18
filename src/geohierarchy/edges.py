@@ -313,3 +313,49 @@ def edges_to_h3_by_distance(
     )
 
     return pl.concat([matched_result, fallback_df], how="vertical")
+
+
+def h3_cells_near_lines(geoms_4326, resolution: int, max_dist_m: float, region=None):
+    """uint64 ids of every H3 cell at `resolution` whose centre is within `max_dist_m` of one of the lines `geoms_4326` (EPSG:4326 shapely
+    geometries); with `region` (a 4326 polygon), only cells whose centre is inside it.
+
+    Candidates: the cells of the lines' vertices densified every `min(edge, max_dist_m / 10)` m (at least 2 m) and their rings out to
+    `max_dist_m`; then the exact test: each candidate centre's distance to the densified vertices (KD tree; the error is below half the
+    densification step). Chunk large line sets yourself and union the results.
+
+    Args:
+        geoms_4326: Line geometries in EPSG:4326 (shapely).
+        resolution: H3 resolution of the cells.
+        max_dist_m: Distance from the lines, in metres, within which a cell's centre must lie.
+        region: Optional EPSG:4326 polygon: only cells whose centre is inside it are kept.
+
+    Returns:
+        Sorted unique ``uint64`` H3 cell ids.
+    """
+    import h3
+    import h3ronpy
+    import h3ronpy.vector as h3v
+    import shapely
+    from scipy.spatial import cKDTree
+
+    geoms = np.asarray(geoms_4326)
+    if not len(geoms):
+        return np.zeros(0, dtype=np.uint64)
+    edge = h3.average_hexagon_edge_length(resolution, unit="m")
+    step = max(2.0, min(edge, max_dist_m / 10.0))
+    k = int(np.ceil(max_dist_m / (edge * np.sqrt(3)))) + 1
+    b = shapely.bounds(geoms)
+    lat0 = float(np.nanmean(b[:, [1, 3]]))
+    m_lon, m_lat = 111_320.0 * np.cos(np.radians(lat0)), 110_574.0
+    pts = shapely.get_coordinates(shapely.segmentize(geoms, step / m_lon))
+    if not len(pts):
+        return np.zeros(0, dtype=np.uint64)
+    base = h3v.coordinates_to_cells(pts[:, 1], pts[:, 0], resolution)
+    cand = np.unique(np.asarray(h3ronpy.grid_disk(base, k, flatten=True)))
+    ll = h3v.cells_to_coordinates(cand)
+    lat, lng = np.asarray(ll["lat"]), np.asarray(ll["lng"])
+    d, _ = cKDTree(np.column_stack([pts[:, 0] * m_lon, pts[:, 1] * m_lat])).query(np.column_stack([lng * m_lon, lat * m_lat]), distance_upper_bound=max_dist_m)
+    near = np.isfinite(d)
+    if region is not None:
+        near &= shapely.contains_xy(region, lng, lat)
+    return cand[near].astype(np.uint64)
