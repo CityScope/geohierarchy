@@ -35,7 +35,6 @@ nav:
   - API reference:
       - Overview: api/index.md
       - aggregation: api/aggregation.md
-      - api_keys: api/api_keys.md
       - chunked_h3_grid: api/chunked_h3_grid.md
       - core: api/core.md
       - edges: api/edges.md

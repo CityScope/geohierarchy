@@ -34,7 +34,7 @@ htmlcov/
 *.swp
 
 # Secrets / credentials (no example/template files ever named this)
-**/api_keys.py
+**/api_keys.json
 **/secrets.txt
 **/.env
 **/.env.*

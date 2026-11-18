@@ -135,12 +135,26 @@ def get_country_region(
     return country_code, subdivision_code
 
 
-def get_city_geometry(city_name: str, user_agent: str = USER_AGENT) -> gpd.GeoDataFrame:
-    """A place's boundary polygon from Nominatim.
+def get_city_geometry(
+    city_name: str,
+    user_agent: str = USER_AGENT,
+    cache_dir: Optional[Union[str, Path]] = None,
+    limit: int = 10,
+    attempts: int = 4,
+) -> gpd.GeoDataFrame:
+    """A place's boundary polygon from Nominatim: the first Polygon / MultiPolygon among its answers (a bare point -- a place
+    marker -- is skipped).
+
+    Nominatim is rate limited and sometimes answers differently under load: answers without a polygon are asked again
+    (``attempts`` times, with a growing wait). With ``cache_dir`` the boundary is saved there and read back next time, so the
+    same name always gives the same polygon (delete the file to search again).
 
     Args:
         city_name: Place name.
         user_agent: User agent sent to Nominatim.
+        cache_dir: Folder of cached boundaries (``<sha1 of the name>.geojson``); None = no cache.
+        limit: Answers requested per search.
+        attempts: Searches before giving up.
 
     Returns:
         One-row GeoDataFrame (EPSG:4326) with ``name`` / ``display_name`` (the place's full name).
@@ -148,12 +162,28 @@ def get_city_geometry(city_name: str, user_agent: str = USER_AGENT) -> gpd.GeoDa
     Raises:
         ValueError: If no boundary polygon is found.
     """
-    params = {"q": city_name, "format": "jsonv2", "polygon_geojson": 1, "limit": 1}
-    results = _nominatim_get("search", params, user_agent=user_agent, timeout=10).json()
-    if not results or "geojson" not in results[0]:
-        raise ValueError(f"No boundary polygon found for {city_name!r}.")
-    name = results[0].get("display_name", city_name)
-    return gpd.GeoDataFrame({"name": [name], "display_name": [name]}, geometry=[shapely_shape(results[0]["geojson"])], crs="EPSG:4326")
+    import hashlib
+
+    cached = Path(cache_dir) / (hashlib.sha1(city_name.encode("utf-8")).hexdigest()[:16] + ".geojson") if cache_dir else None
+    if cached is not None and cached.is_file():
+        gdf = gpd.read_file(cached).to_crs(4326)
+        if "name" not in gdf.columns and "display_name" in gdf.columns:
+            gdf.insert(0, "name", gdf["display_name"])
+        return gdf
+    params = {"q": city_name, "format": "jsonv2", "polygon_geojson": 1, "limit": limit}
+    for attempt in range(1, attempts + 1):
+        for result in _nominatim_get("search", params, user_agent=user_agent, timeout=30).json():
+            geojson = result.get("geojson") or {}
+            if geojson.get("type") in ("Polygon", "MultiPolygon"):
+                name = result.get("display_name", city_name)
+                gdf = gpd.GeoDataFrame({"name": [name], "display_name": [name]}, geometry=[shapely_shape(geojson)], crs="EPSG:4326")
+                if cached is not None:
+                    cached.parent.mkdir(parents=True, exist_ok=True)
+                    gdf.to_file(cached, driver="GeoJSON")
+                return gdf
+        if attempt < attempts:
+            time.sleep(5 * attempt)
+    raise ValueError(f"No boundary polygon found for {city_name!r}.")
 
 
 def get_geographic_suggestions_from_string(

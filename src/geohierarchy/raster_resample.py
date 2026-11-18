@@ -251,7 +251,7 @@ def raster_to_h3(
     :func:`raster_to_polygons`. This is the generic primitive
     ``pycensus``'s WorldPop loader applies with WorldPop-specific knowledge
     (nodata handling, AOI cropping, CRS choice) layered on top -- see
-    ``pycensus.countries.worldwide.worldpop.loader``.
+    ``pycensus.census.worldwide.worldpop.loader``.
 
     Args:
         raster_array: 2D array of pixel values.
