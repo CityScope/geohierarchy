@@ -1,5 +1,7 @@
 site_name: geohierarchy
 site_description: Hierarchical geospatial levels with automatic resampling
+site_url: https://cityscope.github.io/geohierarchy/
+repo_url: https://github.com/CityScope/geohierarchy
 docs_dir: docs
 theme:
   name: material
