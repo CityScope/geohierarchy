@@ -201,18 +201,18 @@ correctly reaches both `region_a` and `region_b`.
 ## Walkthrough: geohierarchy in 5 steps (plus H3, LineString, and raster layers)
 
 This section is the literal, executed content of
-[`examples/geohierarchy_walkthrough.ipynb`](examples/geohierarchy_walkthrough.ipynb)
+[`examples/geohierarchy_walkthrough.ipynb`](https://github.com/CityScope/geohierarchy/blob/main/examples/geohierarchy_walkthrough.ipynb)
 against the real fixtures in `tests/test_files/` -- same code, same
 outputs, same plots, not retyped by hand. Regenerate it after editing the
 notebook with:
 
 ```bash
 jupyter nbconvert --to markdown examples/geohierarchy_walkthrough.ipynb \
-    --output-dir examples --output geohierarchy_walkthrough
+    --output-dir docs/images --output geohierarchy_walkthrough
 ```
 
-then paste the resulting `examples/geohierarchy_walkthrough.md` back into
-this section, prefixing image paths with `examples/`.
+then paste the resulting `docs/images/geohierarchy_walkthrough.md` back into
+this section, prefixing image paths with `images/`, and delete that `.md` file.
 
 ---
 
@@ -323,7 +323,7 @@ gh["tract"].plot(column="accessibility", legend=True)
 
 
 
-![jpeg](examples/geohierarchy_walkthrough_files/geohierarchy_walkthrough_8_1.jpg)
+![jpeg](images/geohierarchy_walkthrough_files/geohierarchy_walkthrough_8_1.jpg)
 
 
 
@@ -379,7 +379,7 @@ ax.set_axis_off()
 
 
 
-![jpeg](examples/geohierarchy_walkthrough_files/geohierarchy_walkthrough_12_0.jpg)
+![jpeg](images/geohierarchy_walkthrough_files/geohierarchy_walkthrough_12_0.jpg)
 
 
 
@@ -427,7 +427,7 @@ ax.set_axis_off()
 
 
 
-![jpeg](examples/geohierarchy_walkthrough_files/geohierarchy_walkthrough_15_0.jpg)
+![jpeg](images/geohierarchy_walkthrough_files/geohierarchy_walkthrough_15_0.jpg)
 
 
 
@@ -488,11 +488,11 @@ ax.set_axis_off()
 
 
 
-![jpeg](examples/geohierarchy_walkthrough_files/geohierarchy_walkthrough_18_0.jpg)
+![jpeg](images/geohierarchy_walkthrough_files/geohierarchy_walkthrough_18_0.jpg)
 
 
 
 ## More examples
 
-Open [`examples/geohierarchy_walkthrough.ipynb`](examples/geohierarchy_walkthrough.ipynb)
+Open [`examples/geohierarchy_walkthrough.ipynb`](https://github.com/CityScope/geohierarchy/blob/main/examples/geohierarchy_walkthrough.ipynb)
 directly to run it interactively.
