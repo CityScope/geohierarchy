@@ -1784,6 +1784,9 @@ def save_multi_maplibre(
     <hr>
     <div style="margin-top:4px;">
       {"<div id='circleSizeByRow'><label style='display:block;'>Circle size by<br><select id='circleFieldSelect' style='width:100%;'>" + circle_field_options_html + "</select></label></div>" if circle_field_options_html else ""}
+      <label id="circleScaleRow" style="display:block;margin-top:6px;">Circle size <span id="circleScaleValue">100%</span><br>
+        <input type="range" id="circleScaleSlider" min="30" max="300" value="100" style="width:100%;">
+      </label>
       <label style="display:block;margin-top:6px;">Hex/circle/census opacity <span id="shapeOpacityValue">75%</span><br>
         <input type="range" id="shapeOpacitySlider" min="0" max="100" value="75" style="width:100%;">
       </label>
@@ -1885,7 +1888,7 @@ def save_multi_maplibre(
     function __circleRadiusPx(v, d1, maxRadius, minRadius) {{
       var r0 = minRadius == null ? __CIRC_MIN : minRadius;
       var sh = Math.max(0, Math.min(1, (v || 0) / (d1 > 0 ? d1 : 1e-9)));
-      return r0 + (maxRadius - r0) * Math.pow(sh, __CIRC_EXP);
+      return (r0 + (maxRadius - r0) * Math.pow(sh, __CIRC_EXP)) * (window.__circleScale || 1);
     }}
     // Neighbouring H3 cell centres are ~this many km apart, a distance that doubles on screen with every zoom level. The radius range follows
     // that spacing at the zoom drawn: the largest circle 1.1x the spacing (capped by the resolution's fixed maximum; with the size domain ending at the 99.5th percentile only the densest cells get near it), the smallest 0.22x
@@ -1902,9 +1905,10 @@ def save_multi_maplibre(
       __circleLayerIds.forEach(function(id) {{
         var L = map.getLayer(id); if (!L) return;
         var lo = L.minzoom || 0, hi = Math.min(L.maxzoom == null ? 24 : L.maxzoom, lo + 4), d = __domainsForLayer(id), f = window.__circleField;
-        var a = __radiusRangeAt(id, lo), b = __radiusRangeAt(id, hi);
-        map.setPaintProperty(id, 'circle-radius', a[0] === b[0] && a[1] === b[1] ? __circleRadiusExpr(f, d, a[1], a[0])
-          : ['interpolate', ['exponential', 2], ['zoom'], lo, __circleRadiusExpr(f, d, a[1], a[0]), hi, __circleRadiusExpr(f, d, b[1], b[0])]);
+        var a = __radiusRangeAt(id, lo), b = __radiusRangeAt(id, hi), k = window.__circleScale || 1;   // k: the "Circle size" slider
+        var sc = function(e) {{ return k === 1 ? e : ['*', k, e]; }};   // inside each stop: a zoom curve must stay the top-level expression
+        map.setPaintProperty(id, 'circle-radius', a[0] === b[0] && a[1] === b[1] ? sc(__circleRadiusExpr(f, d, a[1], a[0]))
+          : ['interpolate', ['exponential', 2], ['zoom'], lo, sc(__circleRadiusExpr(f, d, a[1], a[0])), hi, sc(__circleRadiusExpr(f, d, b[1], b[0]))]);
       }});
     }}
     // Legend sub-sections (`#circleLegend`/`#opacityLegend`/`#devLegend` --
@@ -2008,6 +2012,15 @@ def save_multi_maplibre(
         __updateCircleLegend();
       }});
       if (map.loaded()) __applyCircleRadius(); else map.once('load', __applyCircleRadius);   // the layers exist only once the style has loaded
+    }}
+    var __circleScaleSlider = document.getElementById('circleScaleSlider');
+    if (__circleScaleSlider) {{
+      __circleScaleSlider.addEventListener('input', function(e) {{
+        window.__circleScale = parseInt(e.target.value, 10) / 100;
+        document.getElementById('circleScaleValue').textContent = e.target.value + '%';
+        __applyCircleRadius();
+        __updateCircleLegend();
+      }});
     }}
     if (typeof map !== 'undefined' && map.on && Object.keys(__circleZoomBands).length) {{
       map.on('zoomend', __updateCircleLegend);
@@ -2164,8 +2177,10 @@ def save_multi_maplibre(
     // shown (and editable) even while pointing at layers it could never
     // actually affect.
     var __circleSizeByRow = document.getElementById('circleSizeByRow');
+    var __circleScaleRow = document.getElementById('circleScaleRow');
     function __updateCircleSizeByVisibility(activeGroup) {{
       if (__circleSizeByRow) __circleSizeByRow.style.display = (activeGroup === 'circles') ? '' : 'none';
+      if (__circleScaleRow) __circleScaleRow.style.display = (activeGroup === 'circles') ? 'block' : 'none';
     }}
     document.querySelectorAll('input[name="__base_group"]').forEach(function(el) {{
       el.addEventListener('change', function() {{
