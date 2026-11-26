@@ -47,7 +47,8 @@ def _nominatim_get(path: str, params: dict, user_agent: str = USER_AGENT, timeou
     for attempt in range(6):
         try:
             resp = requests.get(f"{NOMINATIM}/{path}", headers={"User-Agent": user_agent}, params=params, timeout=timeout)
-            if resp.status_code in (429, 500, 502, 503, 504):
+            blocked = resp.status_code >= 600 or (resp.ok and resp.text[:30].lstrip().startswith(("<?xml", "<!DOCTYPE", "<html")))   # a throttling page, not an answer
+            if resp.status_code in (429, 500, 502, 503, 504) or blocked:
                 wait = float(resp.headers.get("Retry-After") or 0) or 2.0 * (attempt + 1)
                 time.sleep(min(wait, 60))
                 last = requests.HTTPError(f"{resp.status_code} from Nominatim")
