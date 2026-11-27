@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import tempfile
+import threading
 import time
 import warnings
 from difflib import get_close_matches
@@ -41,23 +42,54 @@ def get_cache_dir(cache_dir: Optional[Union[str, Path]] = None) -> Path:
     return Path(cache_dir or os.environ.get(CACHE_ENV_VAR) or Path(tempfile.gettempdir()) / "geohierarchy-cache")
 
 
+_NOMINATIM_LOCK = threading.Lock()
+_NOMINATIM_STATE = {"last": 0.0, "blocked_until": 0.0, "wait": 0.0}
+NOMINATIM_MIN_INTERVAL_S = 1.1     # Nominatim's usage policy: at most one request per second, from every thread together
+NOMINATIM_BLOCK_WAIT_S = 60.0      # after a rate-limit answer no request is sent for this long, doubling at each further refusal (asking again only prolongs the block)
+NOMINATIM_BLOCK_MAX_S = 300.0
+
+
 def _nominatim_get(path: str, params: dict, user_agent: str = USER_AGENT, timeout: float = 30) -> requests.Response:
-    """One Nominatim request with retries on rate limits, server errors and dropped connections."""
+    """One Nominatim request, at most one per `NOMINATIM_MIN_INTERVAL_S` however many threads ask. A rate-limit answer (HTTP 429, a 6xx such as
+    629, or an HTML page instead of data) is waited out twice with growing pauses; if it persists the service is left alone for
+    `NOMINATIM_BLOCK_WAIT_S` (60 s, doubling to 5 minutes; further calls fail at once with a clear message instead of sending more requests). Server errors and dropped
+    connections are retried a few times."""
     last: Optional[Exception] = None
-    for attempt in range(6):
-        try:
-            resp = requests.get(f"{NOMINATIM}/{path}", headers={"User-Agent": user_agent}, params=params, timeout=timeout)
-            blocked = resp.status_code >= 600 or (resp.ok and resp.text[:30].lstrip().startswith(("<?xml", "<!DOCTYPE", "<html")))   # a throttling page, not an answer
-            if resp.status_code in (429, 500, 502, 503, 504) or blocked:
-                wait = float(resp.headers.get("Retry-After") or 0) or 2.0 * (attempt + 1)
-                time.sleep(min(wait, 60))
-                last = requests.HTTPError(f"{resp.status_code} from Nominatim")
-                continue
-            resp.raise_for_status()
-            return resp
-        except requests.RequestException as exc:
-            last = exc
-            time.sleep(2.0 * (attempt + 1))
+    for attempt in range(3):
+        with _NOMINATIM_LOCK:
+            now = time.monotonic()
+            if now < _NOMINATIM_STATE["blocked_until"]:
+                raise requests.HTTPError(f"Nominatim is limiting requests: not asked again for another {_NOMINATIM_STATE['blocked_until'] - now:,.0f} s "
+                                         f"(run the step again in a few minutes)")
+            time.sleep(max(0.0, _NOMINATIM_STATE["last"] + NOMINATIM_MIN_INTERVAL_S - now))
+            try:
+                resp = requests.get(f"{NOMINATIM}/{path}", headers={"User-Agent": user_agent}, params=params, timeout=timeout)
+            except requests.RequestException as exc:
+                last = exc
+                _NOMINATIM_STATE["last"] = time.monotonic()
+                resp = None
+            else:
+                _NOMINATIM_STATE["last"] = time.monotonic()
+        if resp is None:
+            time.sleep(5.0 * (attempt + 1))
+            continue
+        limited = resp.status_code == 429 or resp.status_code >= 600 or (resp.ok and resp.text[:30].lstrip().startswith(("<?xml", "<!DOCTYPE", "<html")))
+        if limited:
+            last = requests.HTTPError(f"{resp.status_code} from Nominatim")
+            if attempt == 1:
+                with _NOMINATIM_LOCK:
+                    wait = min(NOMINATIM_BLOCK_MAX_S, (_NOMINATIM_STATE["wait"] * 2) or NOMINATIM_BLOCK_WAIT_S)
+                    _NOMINATIM_STATE["wait"], _NOMINATIM_STATE["blocked_until"] = wait, time.monotonic() + wait
+                break
+            time.sleep(min(float(resp.headers.get("Retry-After") or 0) or 30.0 * (attempt + 1), 90.0))
+            continue
+        if resp.status_code in (500, 502, 503, 504):
+            last = requests.HTTPError(f"{resp.status_code} from Nominatim")
+            time.sleep(5.0 * (attempt + 1))
+            continue
+        resp.raise_for_status()
+        _NOMINATIM_STATE["wait"] = 0.0   # answered: the next refusal starts again at the short wait
+        return resp
     raise last if last else RuntimeError("Nominatim request failed")
 
 
